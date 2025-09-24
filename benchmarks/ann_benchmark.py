@@ -14,7 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import numpy as np
 
-from infopilot_core.search.retriever import VectorIndex, faiss
+from src.core.search.retriever import VectorIndex, faiss
 
 
 def build_synthetic_index(

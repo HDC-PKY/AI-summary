@@ -41,9 +41,9 @@ except Exception:
 
 
 # 모듈 임포트
-from infopilot_core.data_pipeline.filefinder import FileFinder
-from infopilot_core.data_pipeline.policies import PolicyEngine, SmartFolderPolicy
-from infopilot_core.data_pipeline.pipeline import (
+from src.core.data_pipeline.filefinder import FileFinder
+from src.core.data_pipeline.policies import PolicyEngine, SmartFolderPolicy
+from src.core.data_pipeline.pipeline import (
     run_step2,
     TrainConfig,
     DEFAULT_N_COMPONENTS,
@@ -52,9 +52,9 @@ from infopilot_core.data_pipeline.pipeline import (
     remove_from_corpus,
     CorpusBuilder,
 )
-from infopilot_core.infra import JobScheduler, ScheduleSpec, ScheduledJob, ModelManager
-from infopilot_core.conversation.lnp_chat import LNPChat  # 새로운 LNP Chat 클래스를 임포트
-from infopilot_core.search.retriever import (
+from src.core.infra import JobScheduler, ScheduleSpec, ScheduledJob, ModelManager
+from src.core.conversation.lnp_chat import LNPChat  # 새로운 LNP Chat 클래스를 임포트
+from src.core.search.retriever import (
     VectorIndex,
     MODEL_TEXT_COLUMN,
     _split_tokens,

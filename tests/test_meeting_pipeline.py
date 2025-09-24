@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from infopilot_core.agents.meeting import MeetingJobConfig, MeetingPipeline
+from src.core.agents.meeting import MeetingJobConfig, MeetingPipeline
 
 
 def test_meeting_pipeline_runs(tmp_path: Path) -> None:

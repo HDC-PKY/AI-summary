@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from infopilot_core.infra import ModelManager
+from src.core.infra import ModelManager
 
 pytestmark = pytest.mark.smoke
 
