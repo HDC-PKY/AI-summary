@@ -17,19 +17,9 @@ root_str = str(PROJECT_ROOT)
 if root_str not in sys.path:
     sys.path.insert(0, root_str)
 
-if "infopilot_core" not in sys.modules:
-    try:  # pragma: no cover - best-effort alias setup
-        import infopilot_core as _infopilot_core  # type: ignore
-    except ImportError:
-        import core as _core  # type: ignore
-
-        sys.modules["infopilot_core"] = _core
-        for _name in ("agents", "conversation", "data_pipeline", "infra", "search", "utils"):
-            module = __import__(f"core.{_name}", fromlist=[_name])
-            sys.modules[f"infopilot_core.{_name}"] = module
-            setattr(_core, _name, module)
-    else:  # pragma: no cover - already installed
-        sys.modules.setdefault("infopilot_core", _infopilot_core)
+src_str = str(PROJECT_ROOT / "src")
+if src_str not in sys.path:
+    sys.path.insert(0, src_str)
 
 os.environ.setdefault("JOBLIB_MULTIPROCESSING", "0")
 
@@ -38,8 +28,8 @@ if "JOBLIB_TEMP_FOLDER" not in os.environ:
     os.environ["JOBLIB_TEMP_FOLDER"] = str(joblib_tmp)
     atexit.register(shutil.rmtree, joblib_tmp, True)
 
-from backend.api.app_factory import create_app
-from backend.api.settings import Settings
+from src.api.app_factory import create_app
+from src.api.settings import Settings
 
 
 class StubRetriever:
