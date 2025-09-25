@@ -1,9 +1,7 @@
 {
   "path": "D:/주연테크/사업기획부",
   "agents": [
-    "knowledge_search",
-    "meeting",
-    "photo"
+    "knowledge_search"
   ],
   "security": {
     "processing": "local_only",

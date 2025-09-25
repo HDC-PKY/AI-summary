@@ -1045,15 +1045,11 @@ def cmd_schedule(args):
         print("⚠️ 스케줄러: 정책이 없어 종료합니다.")
         return
 
-    if args.agent != KNOWLEDGE_AGENT:
-        print("⚠️ 스케줄러: 현재는 knowledge_search 에이전트 예약만 지원합니다.")
-        return
-
     scheduler = JobScheduler()
     jobs = _register_policy_jobs(
         scheduler,
         policy_engine=policy_engine,
-        agent=args.agent,
+        agent=KNOWLEDGE_AGENT,
         output_root=Path(args.output_root),
         translate=args.translate,
     )
@@ -1295,12 +1291,6 @@ def main():
         "--policy",
         default=str(DEFAULT_POLICY_PATH),
         help="스마트 폴더 정책 파일 경로 (비활성화하려면 'none').",
-    )
-    ap_schedule.add_argument(
-        "--agent",
-        default=KNOWLEDGE_AGENT,
-        choices=["knowledge_search", "meeting", "photo"],
-        help="예약 실행 대상 에이전트",
     )
     ap_schedule.add_argument(
         "--output-root",

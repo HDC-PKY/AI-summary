@@ -6,8 +6,6 @@
 - `src/core/data_pipeline/pipeline.py` builds the cleaned corpus and topic model artifacts stored in `data/`.
 - `src/core/search/retriever.py` and `src/core/conversation/lnp_chat.py` load the trained model, manage `index_cache/`, and drive the interactive chat.
 - `src/core/data_pipeline/policies/` hosts smart folder policy schemas, examples, and the runtime policy engine used to scope scanning/indexing.
-- `src/core/agents/meeting/` contains the meeting agent MVP (transcription/summarisation stubs) and will evolve with future cycles.
-- `src/core/agents/photo/` contains the photo agent MVP scaffold (tagging, duplicate detection, best-shot reporting).
 - `src/core/infra/` collects shared infrastructure helpers such as offloading strategies, audit logging, and model selection utilities.
 - `data/` hosts generated corpora and models; `models/` is reserved for packaged exports.
 
