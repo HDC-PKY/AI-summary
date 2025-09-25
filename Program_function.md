@@ -1,9 +1,9 @@
 # 프로그램 기능 정의서
 
 ## 1. 플랫폼 개요
-- InfoPilot은 단일 CLI (`infopilot.py`)와 모듈형 에이전트로 구성된 로컬 우선 AI 비서입니다.
-- 핵심 구성요소는 스마트 폴더 정책 엔진, 데이터 파이프라인(스캔·학습·증분), 검색 인덱스, 모델 캐시, 그리고 에이전트별 워크플로로 나뉩니다.
-- 생성된 산출물은 기본적으로 `data/`(코퍼스·모델)와 `index_cache/`(검색 인덱스) 아래에 저장되며, 에이전트별 결과는 정책 또는 명령줄 인자에 따라 폴더가 분리됩니다.
+- InfoPilot은 단일 CLI(`infopilot.py`)와 지식 검색 파이프라인으로 구성된 로컬 우선 AI 비서입니다.
+- 핵심 구성요소는 스마트 폴더 정책 엔진, 데이터 파이프라인(스캔·학습·증분), 검색 인덱스, 모델 캐시, 그리고 LLM 대화 계층으로 나뉩니다.
+- 생성된 산출물은 기본적으로 `data/`(코퍼스·모델)와 `index_cache/`(검색 인덱스) 아래에 저장되며, 정책에 따라 허용된 폴더만 처리됩니다.
 
 ## 2. 스마트 폴더 정책 엔진
 - 정책 정의는 JSON 형식(`config/smart_folders.json`)으로 관리되며, 스키마는 `core/data_pipeline/policies/schema/smart_folder_policy.schema.json`에 존재합니다.
@@ -45,37 +45,16 @@
 - 모델 관리: `ModelManager`가 SentenceTransformer 인스턴스를 재사용하고 참조 해제를 통해 GPU/CPU 메모리를 절약합니다 (`core/infra/models.py`).
 - 예약 실행: `infopilot.py schedule` 명령이 `JobScheduler`(`core/infra/scheduler.py`)를 통해 `indexing.mode = scheduled` 정책에 대한 주기적 스캔·학습을 수행합니다.
 
-## 5. Meeting Agent (회의 비서 MVP)
-- 모듈 위치: `core/agents/meeting/`.
-- 구성 요소
-  - `MeetingPipeline`은 STT(음성 → 텍스트)와 요약 로직을 오케스트레이션하는 플레이스홀더입니다.
-  - `MeetingJobConfig`는 오디오 경로, 출력 디렉터리, 언어, 정책 태그 등을 정의합니다.
-  - 현재 STT/요약 구현은 자리 표시자이며, Whisper·LLM 등을 연결할 확장 포인트를 남깁니다 (`_transcribe`, `_summarise`).
-  - 실행 결과는 `transcript.txt`, `summary.json`, `segments.json`으로 저장되어 요약, 액션 아이템, 결정 사항, 세그먼트 타임라인을 제공합니다.
-- 정책 연동: `policy_tag` 필드로 스마트 폴더 정책과 일관성 있게 관리하도록 설계되었습니다.
-
-## 6. Photo Agent (사진 비서 MVP)
-- 모듈 위치: `core/agents/photo/`.
-- 파이프라인 흐름
-  1. 루트 경로 스캔(`_scan`) – JPEG/PNG/HEIC 파일을 탐색해 `PhotoAsset`으로 수집.
-  2. 태깅(`_tag`) – 현재는 임시 태그와 임베딩을 채우지만, 비전 백엔드 연동을 위한 인터페이스를 제공합니다.
-  3. 중복 판별(`_deduplicate`) – 파일 크기 기반 그룹화 후 2개 이상이면 중복으로 표기.
-  4. 베스트샷 추천(`_pick_best`) – 수정 시각 기준 상위 20장까지 선별.
-  5. 결과 저장 – `photo_report.json`에 베스트샷, 중복 그룹, 정책 태그를 기록.
-- 향후 GPU/ONNX 지원, 유사도 계산 개선 등을 염두에 둔 구조입니다.
-
-## 7. 모델 및 리소스 관리
+## 5. 모델 및 리소스 관리
 - `ModelManager`는 문자열 키로 로드된 모델을 캐시하고 참조 카운트를 제공하여 다중 워커 환경에서도 동일 모델을 재사용합니다 (`core/infra/models.py`).
 - `JobScheduler`는 `ScheduleSpec`/`ScheduledJob`을 기반으로 간단한 협력형 예약 실행을 수행하며, cron 또는 간격 기반 반복을 지원합니다 (`core/infra/scheduler.py`).
 - `Program` 전체는 `docs/cycles/`에서 사이클별 산출물·리스크를 기록하며, Cycle 1에서 스마트 폴더 P0 기능과 스케줄러/모델 매니저가 완성되었습니다 (`docs/cycles/cycle_1.md`).
 
-## 8. CLI 요약
+## 6. CLI 요약
 - `scan` → `train` → `chat`이 기본 플로우이며, `pipeline`은 스캔과 학습을 일괄 실행합니다.
 - `watch`는 증분 작업, `schedule`은 정책 예약, `chat`은 대화형 검색, `train`은 독립 학습 단계입니다.
 - 모든 명령은 `--policy`로 스마트 폴더 정책을 지정하거나 `--policy none`으로 비활성화할 수 있습니다.
 
-## 9. 향후 확장 포인트
-- Meeting/Photo 에이전트는 백엔드 교체가 가능하도록 구성돼 있으며, Whisper·Vision Transformer 등의 실제 모델을 연결할 수 있습니다.
-- Knowledge & Search는 멀티 모델 레지스트리와 GPU 오프로딩(`core/infra/offload.py`)의 기반이 준비되어 있습니다.
-- 정책 스케줄러는 현재 `knowledge_search` 전용이지만, 에이전트 간 파이프라인을 확장할 수 있도록 메타데이터 구조를 포함합니다.
-
+## 7. 향후 확장 포인트
+- Knowledge & Search는 멀티 모델 레지스트리와 GPU 오프로딩(`core/infra/offload.py`) 기반을 유지해 하드웨어별 최적화를 쉽게 확장할 수 있습니다.
+- 정책 스케줄러는 현재 `knowledge_search` 전용으로 운영되며, 향후 추가 워크플로를 연결할 수 있도록 메타데이터 구조를 유지합니다.

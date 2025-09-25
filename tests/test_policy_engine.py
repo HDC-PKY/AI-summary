@@ -30,7 +30,7 @@ def test_policy_engine_resolves_roots(tmp_path: Path) -> None:
     expected_root = (tmp_path / "docs").resolve()
     assert roots == [expected_root]
     assert engine.allows(expected_root / "report.pdf", agent="knowledge_search")
-    assert not engine.allows(expected_root / "report.pdf", agent="meeting")
+    assert not engine.allows(expected_root / "report.pdf", agent="deprecated_agent")
 
 
 def test_policy_engine_manual_mode(tmp_path: Path) -> None:
@@ -56,7 +56,7 @@ def test_policy_engine_filters_records(tmp_path: Path) -> None:
         """
         [
           {"path": "docs", "agents": ["knowledge_search"]},
-          {"path": "private", "agents": ["meeting"], "indexing": {"mode": "manual"}}
+          {"path": "private", "agents": ["deprecated_agent"], "indexing": {"mode": "manual"}}
         ]
         """,
     )

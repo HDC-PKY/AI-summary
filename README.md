@@ -1,13 +1,11 @@
-# AI-summary
-AI 요약 소프트웨어를 구축하고 학습·조회 파이프라인을 돌리기 위한 저장소입니다.
+# InfoPilot Knowledge Assistant
+로컬 문서를 스캔·학습하고 자연어로 탐색할 수 있는 AI 지식 비서입니다. 지속적으로 문서를 인덱싱하고, 의미 기반 검색과 LLM 대화를 연결해 팀/개인의 노하우를 빠르게 찾을 수 있도록 돕습니다.
 
 ## 프로젝트 개요
 - `infopilot.py` : `scan → train → chat` 절차를 오케스트레이션하는 CLI 진입점
 - `src/core/data_pipeline/filefinder.py` : 파일 시스템을 스캔해 후보 목록을 CSV로 저장
 - `src/core/data_pipeline/pipeline.py` : 코퍼스 정제 및 토픽 모델 학습, Parquet/CSV 아티팩트 생성
-- `src/core/search/retriever.py` / `src/core/conversation/lnp_chat.py` : 학습된 모델을 불러와 쿼리 검색 및 대화 인터페이스 제공
-- `src/core/agents/meeting/` : 회의 비서(STT→요약) 파이프라인 초안과 설정이 위치
-- `src/core/agents/photo/` : 사진 비서(태깅·중복 정리) MVP 골격과 설정 템플릿 제공
+- `src/core/search/retriever.py` / `src/core/conversation/lnp_chat.py` : 학습된 모델을 불러와 검색 결과를 조합하고 LLM과의 연속 대화를 구성
 - `src/core/infra/` : 하이브리드 오프로딩/감사 로깅/모델 선택 유틸리티
 - `data/`, `index_cache/` : 생성된 코퍼스와 캐시가 위치하는 디렉터리 (대용량 파일은 커밋 금지)
 

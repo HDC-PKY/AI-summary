@@ -15,9 +15,7 @@
       "items": {
         "type": "string",
         "enum": [
-          "knowledge_search",
-          "meeting",
-          "photo"
+          "knowledge_search"
         ]
       },
       "description": "Agents enabled for this folder"
