@@ -9,14 +9,20 @@ import threading
 from pathlib import Path
 
 # Core logic and helpers
-from src.core.helpers import get_drives, have_all_artifacts
-from src.config import (
-    EXCLUDE_DIRS, SUPPORTED_EXTS,
-    DATA_DIR, MODELS_DIR, CACHE_DIR,
-    CORPUS_PARQUET, FOUND_FILES_CSV, TOPIC_MODEL_PATH
+from ui.utils import (
+    get_drives,
+    have_all_artifacts,
+    EXCLUDE_DIRS,
+    SUPPORTED_EXTS,
+    DATA_DIR,
+    MODELS_DIR,
+    CACHE_DIR,
+    CORPUS_PARQUET,
+    FOUND_FILES_CSV,
+    TOPIC_MODEL_PATH,
+    CorpusBuilder,
+    rebuild_index,
 )
-from src.core.corpus import CorpusBuilder
-from src.core.indexing import run_indexing
 
 def _run_update_index_logic(log_callback, done_callback):
     try:
@@ -46,9 +52,16 @@ def _run_update_index_logic(log_callback, done_callback):
                     try:
                         p_file = Path(root) / file
                         if p_file.suffix.lower() in SUPPORTED_EXTS:
-                             if not any(part in EXCLUDE_DIRS for part in p_file.parts):
-                                stat = p_file.stat()
-                                current_files_list.append({'path': str(p_file), 'size': stat.st_size, 'mtime': stat.st_mtime})
+                                if not any(part in EXCLUDE_DIRS for part in p_file.parts):
+                                    stat = p_file.stat()
+                                    current_files_list.append(
+                                        {
+                                            'path': str(p_file),
+                                            'size': stat.st_size,
+                                            'mtime': stat.st_mtime,
+                                            'ext': p_file.suffix.lower(),
+                                        }
+                                    )
                     except (FileNotFoundError, PermissionError): continue
         current_df = pd.DataFrame(current_files_list)
         log_callback(f"SUCCESS: PC 스캔 완료. ({len(current_df)}개 파일 발견)")
@@ -66,7 +79,18 @@ def _run_update_index_logic(log_callback, done_callback):
         log_callback(f"INFO: 신규 {len(new_files_info)}개, 수정 {len(modified_files_info)}개, 삭제 {len(deleted_paths)}개")
 
         # 4. 코퍼스 업데이트
-        files_to_process = new_files_info + modified_files_info
+        def _with_ext(records):
+            enriched = []
+            for record in records:
+                path = record.get('path')
+                try:
+                    ext = Path(path).suffix.lower()
+                except Exception:
+                    ext = ''
+                enriched.append({**record, 'ext': ext})
+            return enriched
+
+        files_to_process = _with_ext(new_files_info + modified_files_info)
         new_extracted_df = pd.DataFrame()
         if files_to_process:
             log_callback(f"INFO: {len(files_to_process)}개 파일 텍스트 추출 중... (진행률은 콘솔 창에 표시됩니다)")
@@ -87,7 +111,7 @@ def _run_update_index_logic(log_callback, done_callback):
         # 5. 인덱스 재생성
         if CORPUS_PARQUET.exists() and not pd.read_parquet(CORPUS_PARQUET).empty:
             log_callback("INFO: 벡터 인덱스 재생성 중... (진행률은 콘솔 창에 표시됩니다)")
-            run_indexing(corpus_path=CORPUS_PARQUET, cache_dir=CACHE_DIR)
+            rebuild_index(corpus_path=CORPUS_PARQUET, cache_dir=CACHE_DIR)
             log_callback("SUCCESS: 인덱스 재생성 완료.")
         else:
             log_callback("WARNING: 코퍼스가 비어있어 인덱싱을 건너뜁니다.")
@@ -103,22 +127,47 @@ def _run_update_index_logic(log_callback, done_callback):
         done_callback()
 
 class UpdateScreen(ctk.CTkFrame):
-    def __init__(self, master, start_task_callback, end_task_callback, **kwargs):
+    def __init__(self, master, app, start_task_callback, end_task_callback, **kwargs):
         super().__init__(master, **kwargs)
+        self.app = app
         self.start_task_callback = start_task_callback
         self.end_task_callback = end_task_callback
 
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
+        self.grid_rowconfigure(3, weight=1)
 
-        # Initialize UI elements
-        self.warning_label = ctk.CTkLabel(self, text="", font=ctk.CTkFont(size=16))
-        self.train_button_redirect = ctk.CTkButton(self, text="🚀 전체 학습시키기", command=lambda: master.select_frame("train"))
+        self.title_label = ctk.CTkLabel(
+            self,
+            text="증분 업데이트",
+            font=ctk.CTkFont(size=24, weight="bold"),
+        )
+        self.title_label.grid(row=0, column=0, padx=16, pady=(0, 6), sticky="w")
+
+        self.subtitle_label = ctk.CTkLabel(
+            self,
+            text="기존 코퍼스를 기준으로 신규·수정·삭제된 파일만 반영합니다.",
+            font=ctk.CTkFont(size=13),
+            text_color=("#4f4f4f", "#d0d0d0"),
+        )
+        self.subtitle_label.grid(row=1, column=0, padx=16, pady=(0, 12), sticky="w")
+
+        self.warning_label = ctk.CTkLabel(self, text="", font=ctk.CTkFont(size=15))
+        self.train_button_redirect = ctk.CTkButton(
+            self,
+            text="🚀 전체 학습 실행",
+            command=lambda: self.app.select_frame("train"),
+        )
+
         self.options_frame = ctk.CTkFrame(self)
+        self.options_frame.grid_columnconfigure(0, weight=1)
         self.start_button = ctk.CTkButton(self.options_frame, text="▶️ 업데이트 시작", command=self.start_update)
-        self.log_textbox = ctk.CTkTextbox(self, state="disabled", font=ctk.CTkFont(family="monospace"))
+        self.log_textbox = ctk.CTkTextbox(
+            self,
+            state="disabled",
+            font=ctk.CTkFont(family="monospace"),
+        )
 
-        self.refresh_state() # Call refresh_state initially
+        self.refresh_state()
 
     def setup_ui(self):
         # This method is no longer directly called, its logic is integrated into refresh_state
@@ -132,19 +181,20 @@ class UpdateScreen(ctk.CTkFrame):
         self.log_textbox.grid_forget()
 
         if not have_all_artifacts():
-            self.grid_rowconfigure(0, weight=1)
-            self.warning_label.configure(text="⚠️ 기존 학습 데이터가 없습니다. 먼저 전체 학습을 실행해주세요.")
-            self.warning_label.grid(row=0, column=0, pady=(20, 10))
-            self.train_button_redirect.grid(row=1, column=0, pady=10)
+            self.warning_label.configure(text="⚠️ 학습 데이터가 없어 업데이트를 수행할 수 없습니다.")
+            self.warning_label.grid(row=2, column=0, pady=(60, 12))
+            self.train_button_redirect.grid(row=3, column=0, pady=(0, 12))
         else:
             # Re-create/show options_frame and log_textbox
-            self.options_frame.grid(row=0, column=0, padx=20, pady=20, sticky="ew")
-            self.options_frame.grid_columnconfigure(0, weight=1)
+            self.options_frame.grid(row=2, column=0, padx=16, pady=12, sticky="ew")
+            ctk.CTkLabel(
+                self.options_frame,
+                text="새로 추가되거나 수정된 파일만 효율적으로 업데이트합니다.",
+                justify="left",
+            ).grid(row=0, column=0, padx=12, pady=(12, 4), sticky="w")
+            self.start_button.grid(row=1, column=0, padx=12, pady=(0, 12), sticky="ew")
 
-            ctk.CTkLabel(self.options_frame, text="새로 추가되거나 수정된 파일만 효율적으로 업데이트합니다.", justify="left").grid(row=0, column=0, padx=10, pady=10)
-            self.start_button.grid(row=1, column=0, padx=10, pady=10, sticky="ew")
-
-            self.log_textbox.grid(row=1, column=0, padx=20, pady=(0, 20), sticky="nsew")
+            self.log_textbox.grid(row=3, column=0, padx=16, pady=(0, 16), sticky="nsew")
 
     def on_show(self):
         # Called when the frame is brought to front
@@ -161,12 +211,13 @@ class UpdateScreen(ctk.CTkFrame):
 
     def update_done(self):
         self.after(0, self._enable_button)
-        self.end_task_callback() # Notify App that task is done
+        self.end_task_callback("✅ 증분 업데이트가 완료되었습니다.")
 
     def _enable_button(self):
         self.start_button.configure(state="normal", text="▶️ 업데이트 시작")
 
     def start_update(self):
+        self.start_task_callback("⏳ 증분 업데이트를 실행 중입니다...")
         self.start_button.configure(state="disabled", text="업데이트 진행 중...")
         self.log_textbox.configure(state="normal")
         self.log_textbox.delete("1.0", "end")

@@ -1,105 +1,314 @@
 import customtkinter as ctk
+import json
 import sys
-import os
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, Dict, Optional
 
-# Add project root to sys.path for module imports
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 # Import screen modules
 from ui.screens.home_screen import HomeScreen
 from ui.screens.chat_screen import ChatScreen
+from ui.screens.conversation_screen import ConversationScreen
 from ui.screens.train_screen import TrainScreen
 from ui.screens.update_screen import UpdateScreen
+from ui.screens.meeting_screen import MeetingScreen
+from ui.screens.photo_screen import PhotoScreen
+from ui.screens.work_center import WorkCenterScreen
+from ui.smart_folder_context import SmartFolderContext
 
 
 class App(ctk.CTk):
-    def __init__(self):
+    """InfoPilot desktop shell that stitches every agent UI together."""
+
+    NAV_DEFS = (
+        ("home", "홈 대시보드"),
+        ("conversation", "대화 비서"),
+        ("chat", "지식·검색"),
+        ("work_center", "작업 센터"),
+        ("train", "전체 학습"),
+        ("update", "증분 업데이트"),
+        ("meeting", "회의 비서"),
+        ("photos", "사진 정리"),
+    )
+
+    def __init__(self) -> None:
         super().__init__()
 
-        self.title("InfoPilot: AI 기반 문서 검색 엔진")
-        self.geometry("1100x700")
+        self.title("InfoPilot 데스크톱 비서")
+        self.geometry("1280x800")
+        self.minsize(1100, 720)
         self.is_task_running = False
+        self.active_frame_key: str = "home"
+        self.smart_folder_context: Optional[SmartFolderContext] = None
+        self.work_center_events_path = REPO_ROOT / "data" / "work_center" / "events.jsonl"
+        self.work_center_events_path.parent.mkdir(parents=True, exist_ok=True)
 
-        self.grid_rowconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
         self.grid_columnconfigure(1, weight=1)
 
-        # --- Navigation Frame ---
-        self.navigation_frame = ctk.CTkFrame(self, width=140, corner_radius=0)
-        self.navigation_frame.grid(row=0, column=0, sticky="nsew")
-        self.navigation_frame.grid_rowconfigure(5, weight=1)
+        # --- Sidebar navigation ---
+        self.sidebar_frame = ctk.CTkFrame(self, width=220, corner_radius=0)
+        self.sidebar_frame.grid(row=0, column=0, rowspan=3, sticky="nsew")
+        self.sidebar_frame.grid_rowconfigure(len(self.NAV_DEFS) + 2, weight=1)
 
-        self.navigation_frame_label = ctk.CTkLabel(self.navigation_frame, text="InfoPilot",
-                                                   font=ctk.CTkFont(size=20, weight="bold"))
-        self.navigation_frame_label.grid(row=0, column=0, padx=20, pady=20)
+        self.logo_label = ctk.CTkLabel(
+            self.sidebar_frame,
+            text="InfoPilot",
+            font=ctk.CTkFont(size=24, weight="bold"),
+        )
+        self.logo_label.grid(row=0, column=0, padx=24, pady=(30, 4), sticky="w")
 
-        self.home_button = ctk.CTkButton(self.navigation_frame, text="Home", command=lambda: self.select_frame("home"))
-        self.home_button.grid(row=1, column=0, sticky="ew", padx=10, pady=5)
+        self.tagline_label = ctk.CTkLabel(
+            self.sidebar_frame,
+            text="문서 · 회의 · 사진 한 번에",
+            font=ctk.CTkFont(size=13),
+            text_color=("#444", "#d3d3d3"),
+        )
+        self.tagline_label.grid(row=1, column=0, padx=24, pady=(0, 20), sticky="w")
 
-        self.chat_button = ctk.CTkButton(self.navigation_frame, text="Chat", command=lambda: self.select_frame("chat"))
-        self.chat_button.grid(row=2, column=0, sticky="ew", padx=10, pady=5)
+        self.nav_buttons: Dict[str, ctk.CTkButton] = {}
+        for index, (key, label) in enumerate(self.NAV_DEFS, start=2):
+            button = ctk.CTkButton(
+                self.sidebar_frame,
+                text=label,
+                height=44,
+                corner_radius=8,
+                anchor="w",
+                fg_color=("#2b7de9", "#225aa1") if key == "home" else "transparent",
+                hover_color=("#2d83f3", "#1f5bb0"),
+                text_color=("white", "white") if key == "home" else None,
+                command=lambda name=key: self.select_frame(name),
+            )
+            button.grid(row=index, column=0, padx=18, pady=4, sticky="ew")
+            self.nav_buttons[key] = button
 
-        self.train_button = ctk.CTkButton(self.navigation_frame, text="Train",
-                                          command=lambda: self.select_frame("train"))
-        self.train_button.grid(row=3, column=0, sticky="ew", padx=10, pady=5)
+        # Appearance mode switcher anchored to bottom
+        self.appearance_switch = ctk.CTkSegmentedButton(
+            self.sidebar_frame,
+            values=["Light", "Dark", "System"],
+            command=self.change_appearance_mode,
+        )
+        self.appearance_switch.set("System")
+        self.appearance_switch.grid(row=len(self.NAV_DEFS) + 2, column=0, padx=24, pady=(20, 16), sticky="ew")
 
-        self.update_button = ctk.CTkButton(self.navigation_frame, text="Update",
-                                           command=lambda: self.select_frame("update"))
-        self.update_button.grid(row=4, column=0, sticky="ew", padx=10, pady=5)
+        # --- Header ---
+        self.header_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.header_frame.grid(row=0, column=1, padx=(24, 24), pady=(28, 8), sticky="ew")
+        self.header_frame.grid_columnconfigure(0, weight=1)
 
-        # --- Main Content Frames ---
-        # Pass the main app instance (self) to each screen
-        self.home_frame = HomeScreen(self, corner_radius=0, fg_color="transparent")
-        # Pass start_task and end_task methods as callbacks
-        self.chat_frame = ChatScreen(self, corner_radius=0, fg_color="transparent")
-        self.train_frame = TrainScreen(self, start_task_callback=self.start_task, end_task_callback=self.end_task,
-                                       corner_radius=0, fg_color="transparent")
-        self.update_frame = UpdateScreen(self, start_task_callback=self.start_task, end_task_callback=self.end_task,
-                                         corner_radius=0, fg_color="transparent")
+        self.header_title = ctk.CTkLabel(
+            self.header_frame,
+            text="",  # updated in select_frame
+            font=ctk.CTkFont(size=26, weight="bold"),
+        )
+        self.header_title.grid(row=0, column=0, sticky="w")
+
+        self.header_subtitle = ctk.CTkLabel(
+            self.header_frame,
+            text="",  # updated in select_frame
+            font=ctk.CTkFont(size=14),
+            text_color=("#525252", "#d0d0d0"),
+        )
+        self.header_subtitle.grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+        # --- Main frames ---
+        self.content_container = ctk.CTkFrame(self, fg_color="transparent")
+        self.content_container.grid(row=1, column=1, padx=(24, 24), pady=(0, 16), sticky="nsew")
+        self.content_container.grid_rowconfigure(0, weight=1)
+        self.content_container.grid_columnconfigure(0, weight=1)
+
+        self.frame_factories: Dict[str, Callable[[], ctk.CTkFrame]] = {
+            "home": lambda: HomeScreen(self.content_container, app=self, corner_radius=0, fg_color="transparent"),
+            "conversation": lambda: ConversationScreen(self.content_container, app=self, corner_radius=0, fg_color="transparent"),
+            "chat": lambda: ChatScreen(self.content_container, app=self, corner_radius=0, fg_color="transparent"),
+            "work_center": lambda: WorkCenterScreen(self.content_container, app=self, corner_radius=0, fg_color="transparent"),
+            "train": lambda: TrainScreen(
+                self.content_container,
+                app=self,
+                start_task_callback=self.start_task,
+                end_task_callback=self.end_task,
+                corner_radius=0,
+                fg_color="transparent",
+            ),
+            "update": lambda: UpdateScreen(
+                self.content_container,
+                app=self,
+                start_task_callback=self.start_task,
+                end_task_callback=self.end_task,
+                corner_radius=0,
+                fg_color="transparent",
+            ),
+            "meeting": lambda: MeetingScreen(
+                self.content_container,
+                app=self,
+                start_task_callback=self.start_task,
+                end_task_callback=self.end_task,
+                corner_radius=0,
+                fg_color="transparent",
+            ),
+            "photos": lambda: PhotoScreen(
+                self.content_container,
+                app=self,
+                start_task_callback=self.start_task,
+                end_task_callback=self.end_task,
+                corner_radius=0,
+                fg_color="transparent",
+            ),
+        }
+        self.frames: Dict[str, ctk.CTkFrame] = {}
+        self.set_smart_folder_context(None)
+
+        # --- Status bar ---
+        self.status_var = ctk.StringVar(value="Ready.")
+        self.status_bar = ctk.CTkLabel(
+            self,
+            textvariable=self.status_var,
+            anchor="w",
+            height=28,
+            corner_radius=6,
+            padx=16,
+            fg_color=("#e9f2ff", "#1c1c1c"),
+            text_color=("#1f5bb1", "#e0e0e0"),
+        )
+        self.status_bar.grid(row=2, column=0, columnspan=2, padx=24, pady=(0, 20), sticky="ew")
 
         self.select_frame("home")
 
-    def select_frame(self, name):
+    # ------------------------------------------------------------------
+    # Appearance and navigation helpers
+    # ------------------------------------------------------------------
+    def change_appearance_mode(self, new_mode: str) -> None:
+        ctk.set_appearance_mode(new_mode)
+
+    def select_frame(self, name: str) -> None:
         if self.is_task_running:
-            print("Task is running, navigation is disabled.")
+            self.status_var.set("⚙️ 작업이 완료될 때까지 다른 화면으로 이동할 수 없습니다.")
             return
 
-        self.home_frame.grid_forget()
-        self.chat_frame.grid_forget()
-        self.train_frame.grid_forget()
-        self.update_frame.grid_forget()
+        if name not in self.frames and name not in self.frame_factories:
+            raise KeyError(f"Unknown frame: {name}")
 
-        if name == "home":
-            self.home_frame.grid(row=0, column=1, sticky="nsew")
-            self.home_frame.refresh_state()
-        elif name == "chat":
-            self.chat_frame.grid(row=0, column=1, sticky="nsew")
-            self.chat_frame.on_show()  # Call a method to re-initialize if needed
-        elif name == "train":
-            self.train_frame.grid(row=0, column=1, sticky="nsew")
-        elif name == "update":
-            self.update_frame.grid(row=0, column=1, sticky="nsew")
-            self.update_frame.on_show()  # Call a method to refresh state
+        # Hide previous frame
+        for frame in self.frames.values():
+            frame.grid_forget()
 
-    def start_task(self):
-        """Disables navigation when a long task starts."""
+        # Update navigation button colors
+        for key, button in self.nav_buttons.items():
+            is_active = key == name
+            button.configure(fg_color=("#2b7de9", "#225aa1") if is_active else "transparent",
+                             text_color=("white", "white") if is_active else ("gray", "gray"),)
+
+
+        # Show requested frame
+        frame = self._get_or_create_frame(name)
+        frame.grid(row=0, column=0, sticky="nsew")
+
+        # Update header text
+        self.active_frame_key = name
+        header_texts = {
+            "home": ("대시보드", "현재 상태를 확인하고 주요 작업으로 이동하세요."),
+            "conversation": ("대화 비서", "자연어로 질문하고 LLM 요약을 받아보세요."),
+            "work_center": ("작업 센터", "스마트 폴더 컨텍스트와 비서 기능을 한 화면에서 관리하세요."),
+            "chat": ("지식·검색 비서", "학습된 문서를 대상으로 의미 검색을 수행합니다."),
+            "train": ("전체 학습", "새로운 코퍼스를 만들고 인덱스를 재구축합니다."),
+            "update": ("증분 업데이트", "변경된 파일만 빠르게 반영합니다."),
+            "meeting": ("회의 비서", "오디오 또는 전사 파일을 요약하고 액션 아이템을 추출합니다."),
+            "photos": ("사진 비서", "폴더를 정리하고 중복·베스트샷을 추천합니다."),
+        }
+        title, subtitle = header_texts.get(name, (name.title(), ""))
+        self.header_title.configure(text=title)
+        self.header_subtitle.configure(text=subtitle)
+
+        # Allow frames to refresh themselves when shown
+        if hasattr(frame, "on_show"):
+            frame.on_show()
+
+        self.status_var.set("Ready.")
+
+    # ------------------------------------------------------------------
+    # Long running task coordination
+    # ------------------------------------------------------------------
+    def start_task(self, status_message: Optional[str] = None) -> None:
+        """Disable navigation when a long task starts."""
         self.is_task_running = True
-        self.home_button.configure(state="disabled")
-        self.chat_button.configure(state="disabled")
-        self.train_button.configure(state="disabled")
-        self.update_button.configure(state="disabled")
+        for button in self.nav_buttons.values():
+            button.configure(state="disabled")
+        if status_message:
+            self.status_var.set(status_message)
+        else:
+            self.status_var.set("⏳ 작업이 진행 중입니다...")
 
-    def end_task(self):
-        """Enables navigation when a long task ends."""
+    def end_task(self, status_message: Optional[str] = None) -> None:
+        """Re-enable navigation once the long task ends."""
         self.is_task_running = False
-        self.home_button.configure(state="normal")
-        self.chat_button.configure(state="normal")
-        self.train_button.configure(state="normal")
-        self.update_button.configure(state="normal")
+        for button in self.nav_buttons.values():
+            button.configure(state="normal")
+        if status_message:
+            self.status_var.set(status_message)
+        else:
+            self.status_var.set("작업이 완료되었습니다.")
+
+    # ------------------------------------------------------------------
+    # Smart folder context helpers
+    # ------------------------------------------------------------------
+    def set_smart_folder_context(self, context: Optional[SmartFolderContext]) -> None:
+        self.smart_folder_context = context
+        for frame in self.frames.values():
+            handler = getattr(frame, "on_smart_folder_update", None)
+            if callable(handler):
+                handler(context)
+
+    def emit_work_center_event(
+        self,
+        event_type: str,
+        payload: Dict[str, object],
+        *,
+        context: Optional[SmartFolderContext] = None,
+    ) -> None:
+        record_context = context or self.smart_folder_context
+        record = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "type": event_type,
+            "payload": payload,
+            "context": {
+                "folder_id": record_context.folder_id if record_context else None,
+                "folder_label": record_context.label if record_context else None,
+            },
+        }
+        try:
+            with self.work_center_events_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+        for frame in self.frames.values():
+            handler = getattr(frame, "on_work_center_event", None)
+            if callable(handler):
+                handler(record)
+
+    def _get_or_create_frame(self, name: str) -> ctk.CTkFrame:
+        frame = self.frames.get(name)
+        if frame is not None:
+            return frame
+        factory = self.frame_factories.get(name)
+        if factory is None:
+            raise KeyError(f"Unknown frame factory: {name}")
+        frame = factory()
+        self.frames[name] = frame
+        if self.smart_folder_context is not None:
+            handler = getattr(frame, "on_smart_folder_update", None)
+            if callable(handler):
+                handler(self.smart_folder_context)
+        return frame
 
 
 if __name__ == "__main__":
     ctk.set_appearance_mode("System")
-    ctk.set_default_color_theme("blue")
+    ctk.set_default_color_theme("dark-blue")
 
     app = App()
     app.mainloop()

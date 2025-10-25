@@ -1,17 +1,42 @@
-# Bytecode
+# Bytecode / caches
 __pycache__/
 *.py[cod]
+*.pyc
 
-# IDE settings
-.vscode/
-.idea/
+# Build artifacts
+dist/
+build/
+*.spec
 
-# Generated artifacts
-index_cache/
-data/*.csv
-found_files.csv
+# Data & models (runtime artifacts)
+data/
+models/
+*.parquet
+*.joblib
+*.safetensors
+*.pt
+*.bin
+*.ckpt
+*.onnx
 
 # Virtual environments
 .venv/
 venv/
+venv_mac/
+venv_gui/
+conda/
+joblib-*/
 
+# Environment overrides
+.env
+
+# IDE / editor settings
+.vscode/
+.idea/
+.DS_Store
+core/.DS_Store
+
+# Misc
+.cache/
+found_files.csv
+miniconda.sh

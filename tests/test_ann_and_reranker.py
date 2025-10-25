@@ -8,14 +8,14 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-from infopilot_core.search.retriever import (
+from core.search.retriever import (
     EarlyStopConfig,
     Retriever,
     SessionState,
     VectorIndex,
 )
-from backend.api.app_factory import create_app
-from backend.api import session as session_registry
+from core.api.app_factory import create_app
+from core.api import session as session_registry
 
 
 @pytest.mark.smoke

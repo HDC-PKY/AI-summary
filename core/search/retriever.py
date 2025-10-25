@@ -14,12 +14,22 @@ import weakref
 import importlib
 import calendar
 import hashlib
-from collections import deque
+import copy
+from collections import deque, OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+from core.config.paths import MODELS_DIR
+
+# ---------------------------------------------------------------------------
+# Default environment guards for macOS/CPU PyTorch compatibility.
+# These avoid repeated user-side exports for shared memory warnings.
+# ---------------------------------------------------------------------------
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 try:
     import numpy as np
@@ -53,6 +63,19 @@ except Exception:
     CrossEncoder = None
     SentenceTransformer = None
 
+TORCH_META_HINT = """\
+SentenceTransformer 초기화 중 torch 메타 텐서 오류가 발생했습니다.
+현재 설치된 PyTorch 빌드가 SentenceTransformer와 호환되지 않습니다.
+
+macOS/CPU 환경에서는 아래 명령으로 권장 버전을 설치한 뒤 다시 시도해 주세요.
+
+  pip install --upgrade --no-cache-dir \\
+      torch==2.3.0 torchvision==0.18.0 torchaudio==2.3.0 \\
+      --index-url https://download.pytorch.org/whl/cpu
+
+설치 후 `python infopilot.py train` 또는 데스크톱 앱을 다시 실행하면 문제를 해결할 수 있습니다.
+"""
+
 try:
     import torch
 except Exception:
@@ -62,6 +85,25 @@ try:
     import faiss  # type: ignore
 except Exception:
     faiss = None
+else:
+    if hasattr(faiss, "omp_set_num_threads"):
+        try:
+            requested = os.environ.get("FAISS_OMP_NUM_THREADS") or os.environ.get("OMP_NUM_THREADS")
+            threads = max(1, int(requested)) if requested else None
+        except Exception:
+            threads = None
+        if threads is None and sys.platform == "darwin":
+            threads = 1
+        if threads is not None:
+            try:
+                faiss.omp_set_num_threads(max(1, int(threads)))
+            except Exception:
+                pass
+
+try:
+    import hnswlib  # type: ignore
+except Exception:
+    hnswlib = None
 
 try:
     from rank_bm25 import BM25Okapi
@@ -287,6 +329,26 @@ for keyword, exts in _DOMAIN_EXT_HINTS.items():
 # 의미 검색만 사용하도록 BM25 가중치를 비활성화
 _LEXICAL_WEIGHT = 0.0
 _EXTENSION_MATCH_BONUS = 0.05
+
+
+def _resolve_sentence_transformer_location(model_name: str) -> str:
+    """Prefer locally cached SentenceTransformer snapshots when available."""
+    base_dir = MODELS_DIR / "sentence_transformers"
+    if base_dir.exists():
+        direct = base_dir / model_name
+        if direct.exists():
+            return str(direct)
+        cache_dir = base_dir / f"models--{model_name.replace('/', '--')}"
+        snapshots = cache_dir / "snapshots"
+        if snapshots.exists():
+            candidates = sorted(
+                snapshots.iterdir(),
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )
+            if candidates:
+                return str(candidates[0])
+    return model_name
 
 
 def _iter_query_units(lowered: str) -> Set[str]:
@@ -595,12 +657,12 @@ def _classify_query(
     metadata_filters: "MetadataFilters",
     requested_exts: Set[str],
 ) -> str:
-    tokens = _split_tokens((query or "").lower())
+    token_count = _token_count_lower(query)
     if metadata_filters.is_active() or requested_exts:
         return "narrow"
-    if len(tokens) <= 3:
+    if token_count <= 3:
         return "narrow"
-    if len(tokens) >= 10:
+    if token_count >= 12:
         return "broad"
     return "broad"
 
@@ -618,14 +680,15 @@ def _dynamic_search_params(
         requested_exts=requested_exts,
     )
     base_top_k = max(1, int(top_k))
+    token_count = _token_count_lower(query)
     if classification == "narrow":
         oversample = min(6, max(2, base_top_k))
-        rerank_depth = max(base_top_k * 2, 40)
+        rerank_depth = max(base_top_k * 2, 30 + (token_count * 2))
         fusion_depth = max(base_top_k * 2, base_top_k + 10)
     else:
-        oversample = min(10, max(3, base_top_k * 2))
-        rerank_depth = max(base_top_k * 3, 120)
-        fusion_depth = max(base_top_k * 3, base_top_k + 20)
+        oversample = min(12, max(3, base_top_k * 2))
+        rerank_depth = max(base_top_k * 3, 80 + (token_count * 3))
+        fusion_depth = max(base_top_k * 3, base_top_k + 25)
     return {
         "oversample": max(1, oversample),
         "rerank_depth": max(base_top_k, rerank_depth),
@@ -1375,7 +1438,21 @@ class CrossEncoderReranker:
             load_kwargs["device"] = self.device
 
         t0 = time.time()
-        self.model = CrossEncoder(model_name, **load_kwargs)
+        try:
+            self.model = CrossEncoder(model_name, **load_kwargs)
+        except RuntimeError as exc:
+            message = str(exc).lower()
+            if "meta tensor" in message or "to_empty" in message:
+                logger.warning(
+                    "CrossEncoder load failed on device=%s; retrying on CPU. %s",
+                    load_kwargs.get("device", "auto"),
+                    exc,
+                )
+                load_kwargs["device"] = "cpu"
+                self.device = "cpu"
+                self.model = CrossEncoder(model_name, **load_kwargs)
+            else:
+                raise
         dt = time.time() - t0
         device_label = self.device or getattr(self.model, "device", "cpu")
         logger.info("reranker loaded: model=%s device=%s dt=%.1fs", model_name, device_label, dt)
@@ -1568,8 +1645,24 @@ class QueryEncoder:
                     "sentence-transformers 라이브러리가 필요합니다. pip install sentence-transformers"
                 )
             model_name = obj.get("model_name") or DEFAULT_EMBED_MODEL
-            logger.info("Sentence-BERT loaded: %s", model_name)
-            self.embedder = SentenceTransformer(model_name)
+            resolved_model = _resolve_sentence_transformer_location(model_name)
+            if resolved_model != model_name:
+                logger.info("Sentence-BERT loaded (local): %s -> %s", model_name, resolved_model)
+            else:
+                logger.info("Sentence-BERT loaded: %s", model_name)
+            try:
+                self.embedder = SentenceTransformer(resolved_model)
+            except (RuntimeError, NotImplementedError) as exc:
+                message = str(exc).lower()
+                meta_issue = "meta tensor" in message or "to_empty" in message
+                if meta_issue:
+                    logger.warning("SentenceTransformer auto-device load failed; falling back to CPU. %s", exc)
+                    try:
+                        self.embedder = SentenceTransformer(resolved_model, device="cpu")
+                    except Exception as inner_exc:
+                        raise RuntimeError(TORCH_META_HINT) from inner_exc
+                else:
+                    raise
             detected_dim = obj.get("embedding_dim")
             if detected_dim:
                 try:
@@ -1668,6 +1761,8 @@ class VectorIndex:
         self.faiss_index = None
         self.lexical_index: Optional[BM25Okapi] = None
         self.ann_index = None
+        self._ann_backend_active: Optional[str] = None
+        self._ann_hnsw = None
 
         self._matrix_dirty = True
         self._faiss_dirty = True
@@ -1690,6 +1785,14 @@ class VectorIndex:
         arr = np.asarray(vec, dtype=np.float32).reshape(-1)
         norm = float(np.linalg.norm(arr)) + 1e-12
         return (arr / norm).astype(np.float32, copy=False)
+
+    @staticmethod
+    def _ann_backend() -> Optional[str]:
+        if hnswlib is not None:
+            return "hnswlib"
+        if faiss is not None:
+            return "faiss"
+        return None
 
     @staticmethod
     def _normalize_path(path: str) -> str:
@@ -1764,6 +1867,7 @@ class VectorIndex:
 
     def _mark_ann_dirty(self) -> None:
         self._ann_dirty = True
+        self._ann_backend_active = None
 
     def _ensure_matrix(self) -> None:
         if not self._matrix_dirty:
@@ -1784,7 +1888,7 @@ class VectorIndex:
     def _ensure_faiss_index(self) -> None:
         if not self._faiss_dirty:
             return
-        if faiss is None:
+        if faiss is None or self._ann_backend() == "hnswlib":
             self.faiss_index = None
             self._faiss_dirty = False
             return
@@ -2236,7 +2340,8 @@ class VectorIndex:
         return scores, order
 
     def _should_use_ann(self) -> bool:
-        if faiss is None:
+        backend = self._ann_backend()
+        if backend is None:
             return False
         if len(self.doc_ids) < max(1, self.ann_threshold):
             return False
@@ -2246,37 +2351,67 @@ class VectorIndex:
     def _ensure_ann_index(self) -> None:
         if not self._ann_dirty:
             return
-        if faiss is None or not self.doc_ids:
+        backend = self._ann_backend()
+        if backend is None or not self.doc_ids:
             self.ann_index = None
             self._ann_dirty = False
+            self._ann_backend_active = None
             return
         if len(self.doc_ids) < max(1, self.ann_threshold):
             self.ann_index = None
             self._ann_dirty = False
+            self._ann_backend_active = None
             return
         self._ensure_matrix()
         if self.Z is None or self.Z.size == 0:
             self.ann_index = None
             self._ann_dirty = False
+            self._ann_backend_active = None
             return
         dim = self.Z.shape[1]
-        try:
-            hnsw_index = faiss.IndexHNSWFlat(dim, max(8, int(self.ann_m)))
-        except Exception:
-            self.ann_index = None
+
+        if backend == "faiss":
+            try:
+                hnsw_index = faiss.IndexHNSWFlat(dim, max(8, int(self.ann_m)))
+            except Exception:
+                self.ann_index = None
+                self._ann_dirty = False
+                self._ann_backend_active = None
+                return
+            hnsw_index.hnsw.efConstruction = max(16, int(self.ann_ef_construction))
+            hnsw_index.hnsw.efSearch = max(8, int(self.ann_ef_search))
+            ids = np.asarray(self.doc_ids, dtype=np.int64)
+            target_index = hnsw_index if hasattr(hnsw_index, "add_with_ids") else faiss.IndexIDMap(hnsw_index)
+            try:
+                target_index.add_with_ids(self.Z, ids)
+            except Exception:
+                target_index = faiss.IndexIDMap(hnsw_index)
+                target_index.add_with_ids(self.Z, ids)
+            self.ann_index = target_index
+            self._ann_hnsw = hnsw_index
+            self._ann_backend_active = "faiss"
             self._ann_dirty = False
             return
-        hnsw_index.hnsw.efConstruction = max(16, int(self.ann_ef_construction))
-        hnsw_index.hnsw.efSearch = max(8, int(self.ann_ef_search))
-        ids = np.asarray(self.doc_ids, dtype=np.int64)
-        target_index = hnsw_index if hasattr(hnsw_index, "add_with_ids") else faiss.IndexIDMap(hnsw_index)
+
         try:
-            target_index.add_with_ids(self.Z, ids)
+            index = hnswlib.Index(space="ip", dim=dim)
+            index.init_index(
+                max_elements=len(self.doc_ids),
+                ef_construction=max(16, int(self.ann_ef_construction)),
+                M=max(8, int(self.ann_m)),
+            )
+            ids = np.asarray(self.doc_ids, dtype=np.int64)
+            index.add_items(self.Z.astype(np.float32, copy=False), ids)
+            index.set_ef(max(8, int(self.ann_ef_search)))
         except Exception:
-            target_index = faiss.IndexIDMap(hnsw_index)
-            target_index.add_with_ids(self.Z, ids)
-        self.ann_index = target_index
-        self._ann_hnsw = hnsw_index
+            self.ann_index = None
+            self._ann_backend_active = None
+            self._ann_dirty = False
+            return
+
+        self.ann_index = index
+        self._ann_hnsw = None
+        self._ann_backend_active = "hnswlib"
         self._ann_dirty = False
 
     def _ann_scores(self, qvec: np.ndarray, fetch: int) -> Tuple[Dict[int, float], List[int]]:
@@ -2286,23 +2421,36 @@ class VectorIndex:
         k = min(len(self.doc_ids), max(fetch, self.ann_ef_search))
         if k <= 0:
             return {}, []
-        query = qvec.reshape(1, -1).astype(np.float32, copy=False)
+        backend = self._ann_backend_active or self._ann_backend()
+        query_matrix = qvec.reshape(1, -1).astype(np.float32, copy=False)
         try:
-            hnsw_struct = None
-            if hasattr(self.ann_index, "hnsw"):
-                hnsw_struct = self.ann_index.hnsw
-            elif hasattr(self, "_ann_hnsw") and hasattr(self._ann_hnsw, "hnsw"):
-                hnsw_struct = self._ann_hnsw.hnsw
-            if hnsw_struct is not None:
-                hnsw_struct.efSearch = max(self.ann_ef_search, fetch)
-            distances, ids = self.ann_index.search(query, k)
+            if backend == "faiss":
+                hnsw_struct = None
+                if hasattr(self.ann_index, "hnsw"):
+                    hnsw_struct = self.ann_index.hnsw
+                elif hasattr(self, "_ann_hnsw") and hasattr(self._ann_hnsw, "hnsw"):
+                    hnsw_struct = self._ann_hnsw.hnsw
+                if hnsw_struct is not None:
+                    hnsw_struct.efSearch = max(self.ann_ef_search, fetch)
+                _, ids = self.ann_index.search(query_matrix, k)
+            elif backend == "hnswlib":
+                try:
+                    self.ann_index.set_ef(max(self.ann_ef_search, fetch))
+                except Exception:
+                    pass
+                ids, _ = self.ann_index.knn_query(query_matrix, k=k)
+            else:
+                return {}, []
         except Exception:
             return {}, []
+
         scores: Dict[int, float] = {}
         order: List[int] = []
-        if ids.size == 0:
+        if np.size(ids) == 0:
             return scores, order
-        for doc_id in ids[0]:
+
+        candidate_ids = ids[0] if ids.ndim > 1 else ids
+        for doc_id in candidate_ids:
             if doc_id < 0:
                 continue
             doc_id_int = int(doc_id)
@@ -2579,6 +2727,85 @@ class CacheSignatureMonitor:
             self._stop_event.wait(self._interval)
 
 
+class QueryResultCache:
+    """Simple LRU cache for storing annotated search results."""
+
+    def __init__(self, max_entries: int = 128) -> None:
+        self.max_entries = max(1, int(max_entries or 1))
+        self._store: "OrderedDict[Any, Any]" = OrderedDict()
+
+    def get(self, key: Any) -> Optional[Any]:
+        try:
+            value = self._store.pop(key)
+        except KeyError:
+            return None
+        self._store[key] = value
+        return copy.deepcopy(value)
+
+    def set(self, key: Any, value: Any) -> None:
+        self._store[key] = copy.deepcopy(value)
+        self._store.move_to_end(key)
+        while len(self._store) > self.max_entries:
+            self._store.popitem(last=False)
+
+    def clear(self) -> None:
+        self._store.clear()
+
+
+class SemanticQueryCache:
+    """Stores query vectors and associated results for approximate reuse."""
+
+    def __init__(self, max_entries: int = 64, threshold: float = 0.97) -> None:
+        self.max_entries = max(1, int(max_entries or 1))
+        self.threshold = max(0.0, min(1.0, float(threshold)))
+        self._entries: List[Tuple[np.ndarray, Any]] = []
+
+    def match(self, vector: np.ndarray) -> Optional[Any]:
+        if not self._entries:
+            return None
+        try:
+            candidate = VectorIndex._normalize_vector(vector)
+        except Exception:
+            return None
+
+        best_idx: Optional[int] = None
+        best_score = self.threshold
+        for idx, (entry_vec, entry_payload) in enumerate(self._entries):
+            try:
+                score = float(np.dot(entry_vec, candidate))
+            except Exception:
+                continue
+            if score >= best_score:
+                best_idx = idx
+                best_score = score
+
+        if best_idx is None:
+            return None
+
+        entry_vec, entry_payload = self._entries.pop(best_idx)
+        self._entries.append((entry_vec, entry_payload))
+        return copy.deepcopy(entry_payload)
+
+    def store(self, vector: np.ndarray, payload: Any) -> None:
+        try:
+            normalised = VectorIndex._normalize_vector(vector)
+        except Exception:
+            return
+        self._entries.append((normalised, copy.deepcopy(payload)))
+        if len(self._entries) > self.max_entries:
+            self._entries.pop(0)
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+    def set_threshold(self, new_threshold: float) -> None:
+        self.threshold = max(0.0, min(1.0, float(new_threshold)))
+
+
+def _token_count_lower(query: str) -> int:
+    return len(_split_tokens((query or "").lower()))
+
+
 class Retriever:
     def __init__(
         self,
@@ -2598,6 +2825,9 @@ class Retriever:
         auto_refresh: bool = True,
         refresh_interval: float = 1.5,
         refresh_stability_checks: int = 2,
+        result_cache_size: int = 128,
+        semantic_cache_size: int = 64,
+        semantic_cache_threshold: float = 0.97,
     ):
         self.model_path = Path(model_path)
         self.corpus_path = Path(corpus_path)
@@ -2629,6 +2859,18 @@ class Retriever:
         self._auto_refresh = bool(auto_refresh)
         self._refresh_interval = max(0.1, float(refresh_interval)) if refresh_interval else 0.0
         self._refresh_stability_checks = max(1, int(refresh_stability_checks))
+
+        self._result_cache = QueryResultCache(result_cache_size)
+        self._semantic_cache = None
+        if semantic_cache_size > 0 and semantic_cache_threshold > 0.0:
+            self._semantic_cache = SemanticQueryCache(semantic_cache_size, semantic_cache_threshold)
+        self._semantic_cache_initial_threshold = semantic_cache_threshold
+        self._cache_stats = {
+            "result_hits": 0,
+            "result_misses": 0,
+            "semantic_hits": 0,
+            "semantic_misses": 0,
+        }
 
         if self._auto_refresh and self._refresh_interval > 0.0:
             self._cache_monitor = CacheSignatureMonitor(
@@ -2691,6 +2933,15 @@ class Retriever:
         session: Optional[SessionState] = None,
         use_ann: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
+        cache_key: Optional[Tuple[str, int, bool, float]] = None
+        result_cache = getattr(self, "_result_cache", None)
+        if session is None and result_cache is not None:
+            cache_key = self._make_cache_key(query, top_k)
+            cached = result_cache.get(cache_key)
+            if cached is not None:
+                self._record_cache_event("result", hit=True)
+                return cached
+
         index = self._ensure_index()
         if index is None:
             return []
@@ -2757,8 +3008,24 @@ class Retriever:
         if use_rerank:
             search_top_k = max(search_top_k, effective_rerank_depth)
             search_oversample = max(1, min(oversample, 2))
-        adaptive_lex_weight = self._dynamic_lexical_weight(query_tokens)
+        adaptive_lex_weight = self._dynamic_lexical_weight(query_tokens, filters_active=metadata_filters.is_active())
         self._last_lexical_weight = adaptive_lex_weight
+        semantic_cache = getattr(self, "_semantic_cache", None)
+        semantic_cached: Optional[List[Dict[str, Any]]] = None
+        can_use_semantic_cache = (
+            session is None
+            and semantic_cache is not None
+            and q_vector is not None
+            and not metadata_filters.is_active()
+            and not requested_exts
+        )
+
+        if can_use_semantic_cache:
+            semantic_cached = semantic_cache.match(q_vector)
+            if semantic_cached is not None:
+                self._record_cache_event("semantic", hit=True)
+                return self._return_cached(cache_key, semantic_cached, session)
+
         if hasattr(index, "configure_ann"):
             ann_ef = max(32, search_top_k * max(1, search_oversample))
             try:
@@ -2776,7 +3043,7 @@ class Retriever:
         )
         filtered_hits = _apply_metadata_filters(raw_hits, metadata_filters)
         if not filtered_hits:
-            return []
+            return self._return_cached(cache_key, [], session)
 
         lexical_limit = max(top_k, 1)
         if use_rerank and effective_rerank_depth:
@@ -2795,7 +3062,7 @@ class Retriever:
             mmr_limit = max(top_k, min(len(lexical_ranking), fusion_depth))
             mmr_candidates = lexical_ranking[:mmr_limit]
             final_hits = _mmr(index, mmr_candidates, q_vector, top_k)
-            return _annotate_hits(
+            annotated = _annotate_hits(
                 final_hits,
                 desired_exts=requested_exts,
                 raw_query_tokens=raw_query_tokens_set,
@@ -2803,13 +3070,18 @@ class Retriever:
                 metadata_filters=metadata_filters,
                 lexical_weight=adaptive_lex_weight,
             )
+            if can_use_semantic_cache and semantic_cache is not None and q_vector is not None:
+                semantic_cache.store(q_vector, annotated)
+                self._record_cache_event("semantic", hit=False)
+            self._record_cache_event("result", hit=False)
+            return self._return_cached(cache_key, annotated, session)
 
         reranker = self._ensure_reranker()
         if reranker is None:
             mmr_limit = max(top_k, min(len(lexical_ranking), fusion_depth))
             mmr_candidates = lexical_ranking[:mmr_limit]
             final_hits = _mmr(index, mmr_candidates, q_vector, top_k)
-            return _annotate_hits(
+            annotated = _annotate_hits(
                 final_hits,
                 desired_exts=requested_exts,
                 raw_query_tokens=raw_query_tokens_set,
@@ -2817,6 +3089,11 @@ class Retriever:
                 metadata_filters=metadata_filters,
                 lexical_weight=adaptive_lex_weight,
             )
+            if can_use_semantic_cache and semantic_cache is not None and q_vector is not None:
+                semantic_cache.store(q_vector, annotated)
+                self._record_cache_event("semantic", hit=False)
+            self._record_cache_event("result", hit=False)
+            return self._return_cached(cache_key, annotated, session)
 
         reranked = reranker.rerank(
             query,
@@ -2854,7 +3131,7 @@ class Retriever:
         mmr_pool_size = max(top_k * 2, fusion_depth)
         mmr_candidates = fused_candidates[:mmr_pool_size]
         final_hits = _mmr(index, mmr_candidates, q_vector, top_k)
-        return _annotate_hits(
+        annotated = _annotate_hits(
             final_hits,
             desired_exts=requested_exts,
             raw_query_tokens=raw_query_tokens_set,
@@ -2862,6 +3139,86 @@ class Retriever:
             metadata_filters=metadata_filters,
             lexical_weight=adaptive_lex_weight,
         )
+        if can_use_semantic_cache and semantic_cache is not None and q_vector is not None:
+            semantic_cache.store(q_vector, annotated)
+            self._record_cache_event("semantic", hit=False)
+        self._record_cache_event("result", hit=False)
+        return self._return_cached(cache_key, annotated, session)
+
+    def _make_cache_key(self, query: str, top_k: int) -> Tuple[str, int, bool, float]:
+        normalized = (query or "").strip().lower()
+        return (
+            normalized,
+            max(1, int(top_k or 1)),
+            bool(getattr(self, "use_rerank", False)),
+            round(float(getattr(self, "base_lexical_weight", 0.0) or 0.0), 3),
+        )
+
+    def _return_cached(
+        self,
+        cache_key: Optional[Tuple[str, int, bool, float]],
+        hits: List[Dict[str, Any]],
+        session: Optional[SessionState],
+    ) -> List[Dict[str, Any]]:
+        result_cache = getattr(self, "_result_cache", None)
+        if cache_key is not None and session is None and result_cache is not None:
+            result_cache.set(cache_key, hits)
+        return hits
+
+    def _record_cache_event(self, kind: str, hit: bool) -> None:
+        stats = getattr(self, "_cache_stats", None)
+        if stats is None:
+            return
+        key = f"{kind}_{'hits' if hit else 'misses'}"
+        if key not in stats:
+            stats[key] = 0
+        stats[key] += 1
+        total = stats.get("result_hits", 0) + stats.get("result_misses", 0)
+        if total > 0 and total % 100 == 0:
+            logger.debug(
+                "cache stats: result_hit_rate=%.2f semantic_hit_rate=%.2f (total=%d)",
+                stats.get("result_hits", 0) / max(1, total),
+                stats.get("semantic_hits", 0) / max(1, stats.get("semantic_hits", 0) + stats.get("semantic_misses", 0)),
+                total,
+            )
+        if kind == "semantic":
+            semantic_total = stats.get("semantic_hits", 0) + stats.get("semantic_misses", 0)
+            if semantic_total and semantic_total % 200 == 0:
+                self._auto_tune_caches(semantic_total)
+
+    def _auto_tune_caches(self, semantic_total: int) -> None:
+        stats = getattr(self, "_cache_stats", None)
+        if stats is None:
+            return
+        semantic_cache = getattr(self, "_semantic_cache", None)
+        if semantic_cache is None:
+            return
+        hits = stats.get("semantic_hits", 0)
+        misses = stats.get("semantic_misses", 0)
+        total = hits + misses
+        if total == 0:
+            return
+        hit_rate = hits / float(total)
+        current_threshold = getattr(semantic_cache, "threshold", self._semantic_cache_initial_threshold)
+        target = current_threshold
+        if hit_rate < 0.15:
+            target = max(0.80, current_threshold - 0.02)
+        elif hit_rate < 0.3:
+            target = max(0.85, current_threshold - 0.01)
+        elif hit_rate > 0.65:
+            target = min(0.995, current_threshold + 0.01)
+        elif hit_rate > 0.5:
+            target = min(0.99, current_threshold + 0.005)
+
+        if abs(target - current_threshold) >= 1e-4:
+            semantic_cache.set_threshold(target)
+            logger.info(
+                "semantic cache threshold tuned from %.3f to %.3f (hit_rate=%.2f, samples=%d)",
+                current_threshold,
+                target,
+                hit_rate,
+                total,
+            )
 
     def _ensure_reranker(self) -> Optional[CrossEncoderReranker]:
         if not getattr(self, "use_rerank", False):
@@ -2881,7 +3238,7 @@ class Retriever:
             self._reranker = None
         return getattr(self, "_reranker", None)
 
-    def _dynamic_lexical_weight(self, query_tokens: Optional[List[str]]) -> float:
+    def _dynamic_lexical_weight(self, query_tokens: Optional[List[str]], *, filters_active: bool = False) -> float:
         base = max(0.0, float(getattr(self, "base_lexical_weight", 0.0)))
         if base <= 0.0:
             return 0.0
@@ -2890,6 +3247,8 @@ class Retriever:
         distinct = len({tok for tok in query_tokens if tok})
         if distinct <= 2:
             return min(0.75, max(base, 0.45))
+        if filters_active:
+            return min(0.85, max(base, 0.35))
         if distinct >= 8:
             return max(0.15, min(base, 0.30))
         return base
@@ -3100,6 +3459,12 @@ class Retriever:
         current: Tuple[float, float, float],
     ) -> None:
         self._cache_signature = current
+        result_cache = getattr(self, "_result_cache", None)
+        if result_cache is not None:
+            result_cache.clear()
+        semantic_cache = getattr(self, "_semantic_cache", None)
+        if semantic_cache is not None:
+            semantic_cache.clear()
         try:
             self.index_manager.clear()
             loaded = self.index_manager.ensure_loaded()
