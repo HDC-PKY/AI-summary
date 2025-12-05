@@ -12,6 +12,7 @@ import queue
 import sys
 import threading
 import time
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -71,9 +72,11 @@ from core.data_pipeline.pipeline import (
     TrainConfig,
     DEFAULT_N_COMPONENTS,
     DEFAULT_EMBED_MODEL,
+    PARQUET_ENGINE,
     update_corpus_file,
     remove_from_corpus,
     CorpusBuilder,
+    SentenceBertModel,
 )
 from core.infra.scheduler import JobScheduler, ScheduleSpec, ScheduledJob
 from core.infra.models import ModelManager
@@ -199,6 +202,21 @@ def _configure_offline_transformers() -> None:
     os.environ.setdefault("HF_HOME", str(base_dir))
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    # Mac(MPS) 환경에서 OOM이 잦을 때만 수동으로 CPU 강제
+    force_cpu = (os.getenv("INFOPILOT_FORCE_CPU", "") or "").strip().lower()
+    if force_cpu in {"1", "true", "yes", "on"}:
+        os.environ.setdefault("PYTORCH_MPS_ENABLE", "0")
+        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+
+def _disable_mps_for_inference(reason: str = "") -> None:
+    """Force CPU fallback for sentence-transformers when MPS OOM/errors occur."""
+    if os.getenv("PYTORCH_MPS_ENABLE", "1") == "0":
+        return
+    os.environ["PYTORCH_MPS_ENABLE"] = "0"
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    if reason:
+        print(f"⚠️ MPS 비활성화 후 CPU로 재시도합니다: {reason}", flush=True)
 
 
 _configure_offline_transformers()
@@ -549,7 +567,17 @@ def _load_sentence_encoder(model_path: Path) -> Tuple[Optional[SentenceTransform
         encoder = manager.get(model_name)
     except Exception as exc:
         print(f"⚠️ SentenceTransformer 모델 로드 실패({model_name}): {exc}")
-        return None, batch_size, model_name
+        # MPS OOM/호환 문제일 수 있으니 CPU 강제 후 한 번만 재시도
+        try:
+            _disable_mps_for_inference(str(exc))
+            # manager는 캐시를 갖고 있어 재생성이 필요하다
+            global _SENTENCE_ENCODER_MANAGER
+            _SENTENCE_ENCODER_MANAGER = None
+            manager = _get_sentence_encoder_manager()
+            encoder = manager.get(model_name)
+        except Exception as exc_retry:
+            print(f"⚠️ CPU 강제 재시도도 실패({model_name}): {exc_retry}")
+            return None, batch_size, model_name
     return encoder, batch_size, model_name
 
 
@@ -888,6 +916,11 @@ def _build_train_config(args) -> TrainConfig:
         embedding_batch_size=getattr(args, "embedding_batch_size", 32),
         async_embeddings=getattr(args, "async_embed", True),
         embedding_concurrency=max(1, int(getattr(args, "embedding_concurrency", 1))),
+        embedding_dtype=getattr(args, "embedding_dtype", "auto"),
+        embedding_chunk_size=max(0, int(getattr(args, "embedding_chunk_size", 0) or 0)),
+        embedding_chunk_start=max(0, int(getattr(args, "embedding_chunk_start", 0) or 0)),
+        embedding_chunk_end=int(getattr(args, "embedding_chunk_end", -1) or -1),
+        embedding_subprocess_fallback=bool(getattr(args, "embedding_subprocess_fallback", True)),
     )
 
 
@@ -912,6 +945,10 @@ def _default_train_config() -> TrainConfig:
         use_sentence_transformer=True,
         embedding_model=DEFAULT_EMBED_MODEL,
         embedding_batch_size=32,
+        embedding_chunk_size=0,
+        embedding_chunk_start=0,
+        embedding_chunk_end=-1,
+        embedding_subprocess_fallback=True,
     )
 
 
@@ -1012,6 +1049,7 @@ def cmd_train(args):
         translate=args.translate,
         scan_state_path=state_path,
         chunk_cache_path=chunk_cache_path,
+        skip_extract=bool(getattr(args, "skip_extract", False)),
     )
     metrics = df.attrs.get("metrics", {}) if hasattr(df, "attrs") else {}
     incremental = df.attrs.get("incremental", {}) if hasattr(df, "attrs") else {}
@@ -1046,7 +1084,9 @@ def cmd_pipeline(args):
     rows = _maybe_limit_rows(filtered_rows, args.limit_files)
 
     if not rows:
-        raise ValueError("유효한 학습 대상 행이 없습니다. 스캔 결과를 확인해주세요.")
+        print("⚠️ 스캔 결과가 없어 파이프라인을 종료합니다. (목록에 포함될 문서가 없습니다.)")
+        print("   → 다른 루트를 지정하거나 스마트 폴더 정책을 확인하세요.")
+        return {}
 
     cfg = _build_train_config(args)
     out_corpus = Path(args.corpus)
@@ -1083,7 +1123,7 @@ def cmd_pipeline(args):
             translate=args.translate,
             auto_train=True,
             rerank=True,
-            rerank_model="cross-encoder/ms-marco-MiniLM-L-6-v2",
+            rerank_model="BAAI/bge-reranker-large",
             rerank_depth=80,
             rerank_batch_size=16,
             rerank_device=None,
@@ -1115,9 +1155,38 @@ def cmd_pipeline(args):
 def cmd_index(args):
     policy_engine = _load_policy_engine(getattr(args, "policy", None))
     scope = getattr(args, "scope", "auto")
+
+    limit = max(0, int(getattr(args, "limit_files", 0) or 0))
+    corpus_path = Path(args.corpus)
+    tmp_corpus: Optional[Path] = None
+
+    if limit:
+        _require_pandas()
+        try:
+            df = pd.read_parquet(corpus_path)
+        except Exception as exc:
+            raise click.ClickException(f"코퍼스를 불러오지 못했습니다: {exc}") from exc
+        if len(df) > limit:
+            df = df.iloc[:limit].copy()
+        tmp_dir = Path(args.cache) / "tmp_index"
+        try:
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            try:
+                tmp_dir = Path(
+                    tempfile.mkdtemp(prefix="tmp_index_", dir=str(Path(args.cache).parent))
+                )
+            except Exception:
+                tmp_dir = Path(tempfile.mkdtemp(prefix="tmp_index_"))
+        tmp_corpus = tmp_dir / f"corpus_limit_{limit}.parquet"
+        engine = PARQUET_ENGINE or "pyarrow"
+        df.to_parquet(tmp_corpus, engine=engine, index=False)
+        corpus_path = tmp_corpus
+        click.echo(f"⚡ 상위 {limit:,}개 문서로 제한하여 인덱싱합니다. ({corpus_path})")
+
     cfg = DocumentAgentConfig(
         model_path=Path(args.model),
-        corpus_path=Path(args.corpus),
+        corpus_path=corpus_path,
         cache_dir=Path(args.cache),
         translate=getattr(args, "translate", False),
         rerank=False,
@@ -1334,7 +1403,7 @@ def cmd_chat(args):
             _print_response(response)
         return
 
-    print("\n💬 InfoPilot Chat 모드입니다. (종료하려면 'exit' 또는 '종료' 입력)")
+    print("\n💬 InfoPilot Chat 모드입니다. 자유롭게 대화하고, 문서 검색이 필요하면 '/search 질문'처럼 입력해 보세요. (종료하려면 'exit' 또는 '종료' 입력)")
     print("   명령어: /search <질문>, /meeting, /photo")
     while True:
         try:
@@ -1356,7 +1425,7 @@ def cmd_chat(args):
 
 def cmd_watch(args):
     if Observer is None:
-        raise RuntimeError("watchdog 라이브러리가 필요합니다. pip install watchdog")
+        raise click.ClickException("watchdog 라이브러리가 필요합니다. pip install watchdog")
 
     encoder, batch_size, model_name = _load_sentence_encoder(Path(args.model))
     if encoder is None:
@@ -1561,6 +1630,20 @@ def _train_options(func):
     func = click.option("--embedding-batch-size", type=int, default=32, show_default=True)(func)
     func = click.option("--embedding-concurrency", type=int, default=1, show_default=True, help="Sentence-BERT 임베딩 비동기 작업자 수")(func)
     func = click.option("--async-embed/--no-async-embed", default=True, show_default=True, help="임베딩 비동기 큐 사용 여부")(func)
+    func = click.option("--embedding-chunk-size", type=int, default=0, show_default=True, help="Sentence-BERT 임베딩 청크 크기(0이면 전체 한 번에)")(func)
+    func = click.option("--embedding-chunk-start", type=int, default=0, show_default=True, help="청크 임베딩 시작 인덱스")(func)
+    func = click.option("--embedding-chunk-end", type=int, default=-1, show_default=True, help="청크 임베딩 끝 인덱스(-1이면 끝까지)")(func)
+    func = click.option(
+        "--embedding-subprocess-fallback/--no-embedding-subprocess-fallback",
+        default=True,
+        show_default=True,
+        help="청크 임베딩 실패 시 CPU로 재시도(subprocess).",
+    )(func)
+    func = click.option(
+        "--skip-extract",
+        is_flag=True,
+        help="기존 corpus/parquet을 그대로 사용하고 추출 단계를 건너뜁니다. (증분/스캔 상태를 업데이트하지 않음)",
+    )(func)
     func = click.option(
         "--embedding-dtype",
         type=click.Choice(["auto", "fp32", "fp16"], case_sensitive=False),
@@ -1621,6 +1704,15 @@ def _pipeline_options(func):
     func = click.option("--embedding-batch-size", type=int, default=32, show_default=True)(func)
     func = click.option("--embedding-concurrency", type=int, default=1, show_default=True)(func)
     func = click.option("--async-embed/--no-async-embed", default=True, show_default=True)(func)
+    func = click.option("--embedding-chunk-size", type=int, default=0, show_default=True, help="Sentence-BERT 임베딩 청크 크기(0이면 전체 한 번에)")(func)
+    func = click.option("--embedding-chunk-start", type=int, default=0, show_default=True, help="청크 임베딩 시작 인덱스")(func)
+    func = click.option("--embedding-chunk-end", type=int, default=-1, show_default=True, help="청크 임베딩 끝 인덱스(-1이면 끝까지)")(func)
+    func = click.option(
+        "--embedding-subprocess-fallback/--no-embedding-subprocess-fallback",
+        default=True,
+        show_default=True,
+        help="청크 임베딩 실패 시 CPU로 재시도(subprocess).",
+    )(func)
     func = click.option(
         "--embedding-dtype",
         type=click.Choice(["auto", "fp32", "fp16"], case_sensitive=False),
@@ -1662,6 +1754,13 @@ def _index_options(func):
         help="스마트 폴더 정책 경로 (비활성화하려면 'none').",
     )(func)
     func = click.option(
+        "--limit-files",
+        type=int,
+        default=0,
+        show_default=True,
+        help="테스트용 상위 N개 문서만 인덱싱 (0=전체).",
+    )(func)
+    func = click.option(
         "--scope",
         type=click.Choice(["auto", "policy", "global"]),
         default="auto",
@@ -1696,7 +1795,7 @@ def _chat_options(func):
     func = click.option("--min-similarity", type=float, default=0.35, show_default=True)(func)
     func = click.option("--lexical-weight", type=float, default=0.35, show_default=True)(func)
     func = click.option("--rerank/--no-rerank", default=True, show_default=True)(func)
-    func = click.option("--rerank-model", default="cross-encoder/ms-marco-MiniLM-L-6-v2", show_default=True)(func)
+    func = click.option("--rerank-model", default="BAAI/bge-reranker-large", show_default=True)(func)
     func = click.option("--rerank-depth", type=int, default=80, show_default=True)(func)
     func = click.option("--rerank-batch-size", type=int, default=16, show_default=True)(func)
     func = click.option("--rerank-device", default=None)(func)
@@ -1931,12 +2030,66 @@ def _run_reembed_pipeline(
         pass
 
 
+@click.command("embed-chunk", help="내부용: 텍스트 리스트(JSON)를 임베딩해 npy로 저장합니다.")
+@click.option("--input", "input_path", required=True, type=click.Path(exists=True, dir_okay=False, path_type=str))
+@click.option("--output", "output_path", required=True, type=click.Path(dir_okay=False, path_type=str))
+@click.option("--model", default=DEFAULT_EMBED_MODEL, show_default=True)
+@click.option("--batch-size", type=int, default=32, show_default=True)
+@click.option("--concurrency", type=int, default=1, show_default=True)
+@click.option(
+    "--dtype",
+    type=click.Choice(["auto", "fp32", "fp16"], case_sensitive=False),
+    default="auto",
+    show_default=True,
+)
+@click.option("--async/--no-async", "async_embed", default=True, show_default=True, help="비동기 임베딩 사용 여부")
+def embed_chunk_command(
+    input_path: str,
+    output_path: str,
+    model: str,
+    batch_size: int,
+    concurrency: int,
+    dtype: str,
+    async_embed: bool,
+) -> None:
+    if SentenceTransformer is None:
+        raise click.ClickException("sentence-transformers 패키지가 필요합니다. pip install sentence-transformers")
+    try:
+        import numpy as np
+    except Exception:
+        raise click.ClickException("numpy 패키지가 필요합니다. pip install numpy")
+
+    try:
+        payload = json.loads(Path(input_path).read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise click.ClickException(f"입력 JSON 로드 실패: {exc}")
+    if not isinstance(payload, list):
+        raise click.ClickException("입력 파일은 텍스트 리스트(JSON 배열)여야 합니다.")
+    texts = [str(item or "") for item in payload]
+
+    cfg = TrainConfig(
+        embedding_model=model,
+        embedding_batch_size=batch_size,
+        embedding_concurrency=max(1, int(concurrency)),
+        embedding_dtype=dtype or "auto",
+        async_embeddings=async_embed,
+        use_sentence_transformer=True,
+        n_clusters=0,
+    )
+    semantic_model = SentenceBertModel(cfg)
+    embeddings = semantic_model.encode(texts, show_progress=False)
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(out_path, embeddings.astype(np.float32, copy=False))
+    click.echo(f"✅ chunk 임베딩 완료 (docs={len(texts):,}) → {out_path}")
+
+
 @click.command("scan")
 @_scan_options
 @click.pass_context
-def scan_command(ctx: click.Context, out: str, roots: Tuple[str, ...], policy: str) -> None:
+def scan_command(ctx: click.Context, out: str, roots: Tuple[str, ...], exts: Tuple[str, ...], policy: str) -> None:
     _require_pandas()
-    args = SimpleNamespace(out=out, roots=list(roots) if roots else None, policy=policy)
+    args = SimpleNamespace(out=out, roots=list(roots) if roots else None, policy=policy, exts=list(exts) if exts else None)
     with _command_session(ctx, "scan") as session:
         count = cmd_scan(args) or 0
         if session:
@@ -1968,6 +2121,12 @@ def train_command(
     chunk_cache: str,
     embedding_concurrency: int,
     async_embed: bool,
+    embedding_dtype: str,
+    embedding_chunk_size: int,
+    embedding_chunk_start: int,
+    embedding_chunk_end: int,
+    embedding_subprocess_fallback: bool,
+    skip_extract: bool,
 ) -> None:
     _require_pandas()
     args = SimpleNamespace(
@@ -1989,6 +2148,12 @@ def train_command(
         chunk_cache=chunk_cache,
         embedding_concurrency=embedding_concurrency,
         async_embed=async_embed,
+        embedding_dtype=embedding_dtype,
+        embedding_chunk_size=embedding_chunk_size,
+        embedding_chunk_start=embedding_chunk_start,
+        embedding_chunk_end=embedding_chunk_end,
+        embedding_subprocess_fallback=embedding_subprocess_fallback,
+        skip_extract=skip_extract,
     )
     with _command_session(ctx, "train") as session:
         stats = cmd_train(args) or {}
@@ -2037,6 +2202,11 @@ def pipeline_command(
     chunk_cache: str,
     embedding_concurrency: int,
     async_embed: bool,
+    embedding_dtype: str,
+    embedding_chunk_size: int,
+    embedding_chunk_start: int,
+    embedding_chunk_end: int,
+    embedding_subprocess_fallback: bool,
 ) -> None:
     _require_pandas()
     normalized = (target or "all").strip().lower()
@@ -2066,6 +2236,11 @@ def pipeline_command(
         chunk_cache=resolved_chunk_cache,
         embedding_concurrency=embedding_concurrency,
         async_embed=async_embed,
+        embedding_dtype=embedding_dtype,
+        embedding_chunk_size=embedding_chunk_size,
+        embedding_chunk_start=embedding_chunk_start,
+        embedding_chunk_end=embedding_chunk_end,
+        embedding_subprocess_fallback=embedding_subprocess_fallback,
     )
     with _command_session(ctx, "pipeline") as session:
         stats = cmd_pipeline(args) or {}
@@ -2096,6 +2271,7 @@ def index_command(
     translate: bool,
     scope: str,
     policy: str,
+    limit_files: int,
 ) -> None:
     _require_pandas()
     args = SimpleNamespace(
@@ -2105,6 +2281,7 @@ def index_command(
         translate=translate,
         scope=scope,
         policy=policy,
+        limit_files=limit_files,
     )
     with _command_session(ctx, "index") as session:
         stats = cmd_index(args) or {}
@@ -2531,6 +2708,10 @@ def drift_auto(
         policy=policy,
         run_name="drift-auto-reembed",
     )
+
+
+# 내부 임베딩 청크 명령 등록
+cli.add_command(embed_chunk_command)
 
 
 def main() -> None:
