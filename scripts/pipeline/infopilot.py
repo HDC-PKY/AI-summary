@@ -320,27 +320,53 @@ def _parse_roots(raw_roots: List[str] | None) -> List[Path] | None:
             continue
         roots.append(p)
     if not roots:
-        print("⚠️ 경고: 사용할 수 있는 루트가 없어 기본 전체 스캔을 수행합니다.")
+        print("⚠️ 경고: 사용할 수 있는 루트가 없습니다.")
         return None
     return roots
 
 
-def _load_policy_engine(policy_arg: Optional[str]) -> PolicyEngine:
+def _load_policy_engine(
+    policy_arg: Optional[str],
+    *,
+    fail_if_missing: bool = False,
+    stage: str = "pipeline",
+) -> PolicyEngine:
+    """Load a policy engine with optional fail-closed semantics."""
+
     raw = (policy_arg or str(DEFAULT_POLICY_PATH)).strip()
-    if raw.lower() == "none" or raw == "":
+    normalized = raw.lower()
+    if normalized in {"none", ""}:
+        if fail_if_missing:
+            raise click.ClickException(
+                f"[{stage}] 스마트 폴더 정책이 없어 파이프라인을 중단합니다. "
+                "정책 파일을 지정하거나 --policy none 과 함께 --root 옵션을 명시하세요."
+            )
         return PolicyEngine.empty()
+
     path = Path(raw).expanduser()
     try:
-        cache_key = path.resolve()
+        resolved = path.resolve()
     except OSError:
-        cache_key = path
+        resolved = path
+
+    if not resolved.exists():
+        message = f"[{stage}] 스마트 폴더 정책 파일을 찾을 수 없습니다: {resolved}"
+        if fail_if_missing:
+            raise click.ClickException(message)
+        print(f"⚠️ {message} (정책 미적용 상태로 진행)", flush=True)
+        return PolicyEngine.empty()
+
+    cache_key = resolved
     engine = _POLICY_CACHE.get(cache_key)
     if engine is None:
         try:
-            engine = PolicyEngine.from_file(path)
+            engine = PolicyEngine.from_file(resolved)
         except Exception as exc:
-            print(f"⚠️ 정책 파일을 불러오지 못했습니다: {exc}")
-            engine = PolicyEngine.empty()
+            message = f"[{stage}] 정책 파일을 불러오지 못했습니다 ({resolved}): {exc}"
+            if fail_if_missing:
+                raise click.ClickException(message) from exc
+            print(f"⚠️ {message}", flush=True)
+            return PolicyEngine.empty()
         _POLICY_CACHE[cache_key] = engine
     return engine
 
@@ -394,8 +420,18 @@ def _run_scan(
 
 
 def cmd_scan(args) -> int:
-    policy_engine = _load_policy_engine(getattr(args, "policy", None))
+    policy_arg = getattr(args, "policy", None)
+    policy_normalized = (policy_arg or "").strip().lower()
+    policy_required = policy_normalized != "none"
+    policy_engine = _load_policy_engine(policy_arg, fail_if_missing=policy_required, stage="scan")
     roots = _parse_roots(args.roots)
+    if not roots and policy_engine and policy_engine.has_policies:
+        roots = policy_engine.roots_for_agent(KNOWLEDGE_AGENT, include_manual=True)
+    if not roots:
+        raise click.ClickException(
+            "스마트 폴더 정책이나 스캔 루트가 없어 scan을 중단합니다. "
+            "Park David Foundation 스펙에 따라 정책 기반 경계가 필수입니다."
+        )
     rows = _run_scan(
         Path(args.out),
         roots,
@@ -1028,7 +1064,10 @@ def _ensure_chat_artifacts(
 
 def cmd_train(args):
     scan_csv = _resolve_scan_csv(Path(args.scan_csv))
-    policy_engine = _load_policy_engine(getattr(args, "policy", None))
+    policy_arg = getattr(args, "policy", None)
+    policy_normalized = (policy_arg or "").strip().lower()
+    policy_required = policy_normalized != "none"
+    policy_engine = _load_policy_engine(policy_arg, fail_if_missing=policy_required, stage="train")
     row_iter = _load_scan_rows(scan_csv, policy_engine=policy_engine, include_manual=True)
     rows = _maybe_limit_rows(row_iter, args.limit_files)
 
@@ -1066,10 +1105,107 @@ def cmd_train(args):
     }
 
 
+def cmd_extract(args):
+    scan_csv = _resolve_scan_csv(Path(args.scan_csv))
+    policy_arg = getattr(args, "policy", None)
+    policy_normalized = (policy_arg or "").strip().lower()
+    policy_required = policy_normalized != "none"
+    policy_engine = _load_policy_engine(policy_arg, fail_if_missing=policy_required, stage="extract")
+    row_iter = _load_scan_rows(scan_csv, policy_engine=policy_engine, include_manual=True)
+    rows = _maybe_limit_rows(row_iter, args.limit_files)
+
+    if not rows:
+        raise ValueError("유효한 추출 대상 행이 없습니다. 스캔 CSV를 확인해주세요.")
+
+    cfg = _build_train_config(args)
+    out_corpus = Path(args.corpus)
+    out_model = Path(args.model)
+    chunk_cache_path = Path(getattr(args, "chunk_cache", DEFAULT_CHUNK_CACHE))
+    state_path = Path(getattr(args, "state_file", DEFAULT_SCAN_STATE))
+    df, _ = run_step2(
+        rows,
+        out_corpus=out_corpus,
+        out_model=out_model,
+        cfg=cfg,
+        use_tqdm=True,
+        translate=args.translate,
+        scan_state_path=state_path,
+        chunk_cache_path=chunk_cache_path,
+        skip_extract=False,
+        train_embeddings=False,
+    )
+    incremental = df.attrs.get("incremental", {}) if hasattr(df, "attrs") else {}
+    print("✅ 추출 완료 (임베딩/모델 생성 없음)")
+    return {
+        "rows": len(rows),
+        "corpus": str(out_corpus),
+        "incremental": incremental,
+    }
+
+
+def cmd_embed(args):
+    scan_csv = _resolve_scan_csv(Path(args.scan_csv))
+    corpus_path = Path(args.corpus)
+    if not corpus_path.exists():
+        raise FileNotFoundError(
+            f"기존 corpus가 없어 임베딩을 진행할 수 없습니다: {corpus_path}. 먼저 extract/train을 실행하세요."
+        )
+
+    policy_arg = getattr(args, "policy", None)
+    policy_normalized = (policy_arg or "").strip().lower()
+    policy_required = policy_normalized != "none"
+    policy_engine = _load_policy_engine(policy_arg, fail_if_missing=policy_required, stage="embed")
+    row_iter = _load_scan_rows(scan_csv, policy_engine=policy_engine, include_manual=True)
+    rows = _maybe_limit_rows(row_iter, args.limit_files)
+
+    if not rows:
+        raise ValueError("유효한 임베딩 대상 행이 없습니다. 스캔 CSV를 확인해주세요.")
+
+    cfg = _build_train_config(args)
+    out_model = Path(args.model)
+    chunk_cache_path = Path(getattr(args, "chunk_cache", DEFAULT_CHUNK_CACHE))
+    state_path = Path(getattr(args, "state_file", DEFAULT_SCAN_STATE))
+    df, tm = run_step2(
+        rows,
+        out_corpus=corpus_path,
+        out_model=out_model,
+        cfg=cfg,
+        use_tqdm=True,
+        translate=args.translate,
+        scan_state_path=state_path,
+        chunk_cache_path=chunk_cache_path,
+        skip_extract=True,
+        train_embeddings=True,
+    )
+    metrics = df.attrs.get("metrics", {}) if hasattr(df, "attrs") else {}
+    incremental = df.attrs.get("incremental", {}) if hasattr(df, "attrs") else {}
+    if metrics:
+        metric_str = ", ".join(f"{k}={v}" for k, v in metrics.items())
+        print(f"📊 임베딩 품질 지표: {metric_str}")
+    print("✅ 임베딩/모델 생성 완료 (기존 corpus 사용)")
+    return {
+        "rows": len(rows),
+        "corpus": str(corpus_path),
+        "model": str(out_model),
+        "metrics": metrics,
+        "incremental": incremental,
+    }
+
+
 def cmd_pipeline(args):
     out = Path(args.out)
+    policy_arg = getattr(args, "policy", None)
+    policy_normalized = (policy_arg or "").strip().lower()
+    policy_required = policy_normalized != "none"
+    policy_engine = _load_policy_engine(policy_arg, fail_if_missing=policy_required, stage="pipeline")
     roots = _parse_roots(args.roots)
-    policy_engine = _load_policy_engine(getattr(args, "policy", None))
+    if not roots and policy_engine and policy_engine.has_policies:
+        roots = policy_engine.roots_for_agent(KNOWLEDGE_AGENT, include_manual=True)
+    if not roots:
+        raise click.ClickException(
+            "스마트 폴더 정책이나 스캔 루트가 없어 파이프라인을 중단합니다. "
+            "정책 파일을 지정하거나 --policy none 과 함께 --root를 명시하세요."
+        )
     scan_rows = _run_scan(
         out,
         roots,
@@ -1153,7 +1289,10 @@ def cmd_pipeline(args):
 
 
 def cmd_index(args):
-    policy_engine = _load_policy_engine(getattr(args, "policy", None))
+    policy_arg = getattr(args, "policy", None)
+    policy_normalized = (policy_arg or "").strip().lower()
+    policy_required = policy_normalized != "none"
+    policy_engine = _load_policy_engine(policy_arg, fail_if_missing=policy_required, stage="index")
     scope = getattr(args, "scope", "auto")
 
     limit = max(0, int(getattr(args, "limit_files", 0) or 0))
@@ -1206,7 +1345,10 @@ def cmd_index(args):
 
 def cmd_chat(args):
     """대화형 검색 모드 (LNPChat 사용)"""
-    policy_engine = _load_policy_engine(getattr(args, "policy", None))
+    policy_arg = getattr(args, "policy", None)
+    policy_normalized = (policy_arg or "").strip().lower()
+    policy_required = policy_normalized != "none"
+    policy_engine = _load_policy_engine(policy_arg, fail_if_missing=policy_required, stage="chat")
     def _env_or_arg(name: str, default: Optional[str] = None) -> Optional[str]:
         value = getattr(args, name, None)
         if value:
@@ -1431,15 +1573,18 @@ def cmd_watch(args):
     if encoder is None:
         raise RuntimeError("sentence-transformers 모델을 로드할 수 없어 watcher를 실행할 수 없습니다.")
 
-    policy_engine = _load_policy_engine(getattr(args, "policy", None))
+    policy_arg = getattr(args, "policy", None)
+    policy_normalized = (policy_arg or "").strip().lower()
+    policy_required = policy_normalized != "none"
+    policy_engine = _load_policy_engine(policy_arg, fail_if_missing=policy_required, stage="watch")
     roots = _parse_roots(args.roots)
+    if not roots and policy_engine and policy_engine.has_policies:
+        roots = policy_engine.roots_for_agent(KNOWLEDGE_AGENT, include_manual=False)
     if not roots:
-        policy_roots = (
-            policy_engine.roots_for_agent(KNOWLEDGE_AGENT, include_manual=False)
-            if policy_engine and policy_engine.has_policies
-            else []
+        raise click.ClickException(
+            "스마트 폴더 정책이나 감시 루트가 지정되지 않아 watcher를 시작할 수 없습니다. "
+            "정책 파일을 지정하거나 --policy none 과 함께 --root를 명시하세요."
         )
-        roots = policy_roots or [Path.cwd()]
 
     deduped_roots: List[Path] = []
     seen_roots: Set[str] = set()
@@ -1463,7 +1608,7 @@ def cmd_watch(args):
         else:
             print(f"⚠️ 감시 루트가 존재하지 않아 제외합니다: {root}")
     if not existing_roots:
-        existing_roots = [Path.cwd()]
+        raise click.ClickException("유효한 감시 루트가 없습니다. 경로를 다시 확인하세요.")
     roots = existing_roots
 
     event_queue: "queue.Queue[Tuple[str, str]]" = queue.Queue()
@@ -1510,7 +1655,7 @@ def cmd_watch(args):
 
 
 def cmd_schedule(args):
-    policy_engine = _load_policy_engine(getattr(args, "policy", None))
+    policy_engine = _load_policy_engine(getattr(args, "policy", None), fail_if_missing=True, stage="schedule")
     if not policy_engine or not policy_engine.has_policies:
         print("⚠️ 스케줄러: 정책이 없어 종료합니다.")
         return
@@ -2009,7 +2154,9 @@ def _run_reembed_pipeline(
     encoder, batch_size, model_name = _load_sentence_encoder(Path(model))
     if encoder is None:
         raise click.ClickException("SentenceTransformer 모델 로드 실패로 재임베딩을 진행할 수 없습니다.")
-    policy_engine = _load_policy_engine(policy)
+    policy_normalized = (policy or "").strip().lower()
+    policy_required = policy_normalized != "none"
+    policy_engine = _load_policy_engine(policy, fail_if_missing=policy_required, stage="reembed")
     pipeline_ctx = IncrementalPipeline(
         encoder=encoder,
         batch_size=batch_size,
@@ -2098,6 +2245,71 @@ def scan_command(ctx: click.Context, out: str, roots: Tuple[str, ...], exts: Tup
     click.echo(f"📦 스캔 완료: {count}건 기록 ({out})")
 
 
+@click.command("extract")
+@_train_options
+@click.pass_context
+def extract_command(
+    ctx: click.Context,
+    scan_csv: str,
+    corpus: str,
+    model: str,
+    max_features: int,
+    n_components: int,
+    n_clusters: int,
+    min_df: int,
+    max_df: float,
+    embedding_model: str,
+    embedding_batch_size: int,
+    limit_files: int,
+    translate: bool,
+    use_embedding: bool,
+    policy: str,
+    state_file: str,
+    chunk_cache: str,
+    embedding_concurrency: int,
+    async_embed: bool,
+    embedding_dtype: str,
+    embedding_chunk_size: int,
+    embedding_chunk_start: int,
+    embedding_chunk_end: int,
+    embedding_subprocess_fallback: bool,
+    skip_extract: bool,
+) -> None:
+    _require_pandas()
+    args = SimpleNamespace(
+        scan_csv=scan_csv,
+        corpus=corpus,
+        model=model,
+        max_features=max_features,
+        n_components=n_components,
+        n_clusters=n_clusters,
+        min_df=min_df,
+        max_df=max_df,
+        embedding_model=embedding_model,
+        embedding_batch_size=embedding_batch_size,
+        limit_files=limit_files,
+        translate=translate,
+        use_embedding=use_embedding,
+        policy=policy,
+        state_file=state_file,
+        chunk_cache=chunk_cache,
+        embedding_concurrency=embedding_concurrency,
+        async_embed=async_embed,
+        embedding_dtype=embedding_dtype,
+        embedding_chunk_size=embedding_chunk_size,
+        embedding_chunk_start=embedding_chunk_start,
+        embedding_chunk_end=embedding_chunk_end,
+        embedding_subprocess_fallback=embedding_subprocess_fallback,
+        skip_extract=False,
+    )
+    with _command_session(ctx, "extract") as session:
+        stats = cmd_extract(args) or {}
+        if session and stats:
+            session.log_params({"corpus": stats.get("corpus"), "policy": policy})
+            session.log_metrics({"rows": float(stats.get("rows", 0))})
+    click.echo(f"📦 추출 완료 → corpus={corpus}")
+
+
 @click.command("train")
 @_train_options
 @click.pass_context
@@ -2171,6 +2383,81 @@ def train_command(
             if extra_metrics:
                 session.log_metrics(extra_metrics)
     click.echo(f"🧠 학습 완료 → corpus={corpus}")
+
+
+@click.command("embed")
+@_train_options
+@click.pass_context
+def embed_command(
+    ctx: click.Context,
+    scan_csv: str,
+    corpus: str,
+    model: str,
+    max_features: int,
+    n_components: int,
+    n_clusters: int,
+    min_df: int,
+    max_df: float,
+    embedding_model: str,
+    embedding_batch_size: int,
+    limit_files: int,
+    translate: bool,
+    use_embedding: bool,
+    policy: str,
+    state_file: str,
+    chunk_cache: str,
+    embedding_concurrency: int,
+    async_embed: bool,
+    embedding_dtype: str,
+    embedding_chunk_size: int,
+    embedding_chunk_start: int,
+    embedding_chunk_end: int,
+    embedding_subprocess_fallback: bool,
+    skip_extract: bool,
+) -> None:
+    _require_pandas()
+    args = SimpleNamespace(
+        scan_csv=scan_csv,
+        corpus=corpus,
+        model=model,
+        max_features=max_features,
+        n_components=n_components,
+        n_clusters=n_clusters,
+        min_df=min_df,
+        max_df=max_df,
+        embedding_model=embedding_model,
+        embedding_batch_size=embedding_batch_size,
+        limit_files=limit_files,
+        translate=translate,
+        use_embedding=use_embedding,
+        policy=policy,
+        state_file=state_file,
+        chunk_cache=chunk_cache,
+        embedding_concurrency=embedding_concurrency,
+        async_embed=async_embed,
+        embedding_dtype=embedding_dtype,
+        embedding_chunk_size=embedding_chunk_size,
+        embedding_chunk_start=embedding_chunk_start,
+        embedding_chunk_end=embedding_chunk_end,
+        embedding_subprocess_fallback=embedding_subprocess_fallback,
+        skip_extract=True,
+    )
+    with _command_session(ctx, "embed") as session:
+        stats = cmd_embed(args) or {}
+        if session and stats:
+            session.log_params(
+                {
+                    "corpus": stats.get("corpus"),
+                    "model": stats.get("model"),
+                    "embedding_model": embedding_model,
+                    "policy": policy,
+                }
+            )
+            session.log_metrics({"rows": float(stats.get("rows", 0))})
+            extra_metrics = stats.get("metrics") or {}
+            if extra_metrics:
+                session.log_metrics(extra_metrics)
+    click.echo(f"🧠 임베딩/모델 완료 → corpus={corpus}")
 
 
 @click.command("pipeline")
@@ -2403,8 +2690,12 @@ cli.add_command(index_command)
 cli.add_command(chat_command)
 cli.add_command(watch_command)
 cli.add_command(schedule_command)
+cli.add_command(extract_command)
+cli.add_command(embed_command)
 run.add_command(scan_command)
+run.add_command(extract_command)
 run.add_command(train_command)
+run.add_command(embed_command)
 run.add_command(index_command)
 run.add_command(chat_command)
 run.add_command(watch_command)
