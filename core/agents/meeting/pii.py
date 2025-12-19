@@ -3,16 +3,8 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from .constants import PII_EMAIL_RE, PII_PHONE_RE
-
-
-def mask_text(text: Optional[str]) -> str:
-    """Redact email addresses and phone numbers from free text."""
-    if not text:
-        return ""
-    masked = PII_EMAIL_RE.sub("[REDACTED_EMAIL]", text)
-    masked = PII_PHONE_RE.sub("[REDACTED_PHONE]", masked)
-    return masked
+# Delegate to the centralized masking patterns
+from .masking_patterns import mask_content as mask_text
 
 
 def mask_segments(segments: Optional[List[dict]]) -> List[dict]:
@@ -26,7 +18,7 @@ def mask_segments(segments: Optional[List[dict]]) -> List[dict]:
         masked_segments.append(
             {
                 **segment,
-                "text": mask_text(segment.get("text")),
+                "text": mask_text(segment.get("text") or ""),
             }
         )
     return masked_segments
